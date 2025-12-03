@@ -1,0 +1,83 @@
+{
+  "manifest_version": 3,
+  "name": "__MSG_extName__",
+  "version": "1.0.1",
+  "description": "__MSG_extDescription__",
+  "default_locale": "en",
+  "cross_origin_opener_policy": {
+    "value": "same-origin"
+  },
+  "cross_origin_embedder_policy": {
+    "value": "require-corp"
+  },
+  "permissions": [
+    "storage",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+    "https://*/*",
+    "http://*/*"
+  ],
+  "background": {
+    "service_worker": "background.bootstrap.js"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": ["scripts/content/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "pages/popup/popup.html",
+    "default_icon": {
+      "16": "assets/icons/icon16.png",
+      "32": "assets/icons/icon32.png",
+      "48": "assets/icons/icon48.png",
+      "128": "assets/icons/icon128.png"
+    }
+  },
+  "options_page": "pages/options/options.html",
+  "icons": {
+    "16": "assets/icons/icon16.png",
+    "32": "assets/icons/icon32.png",
+    "48": "assets/icons/icon48.png",
+    "128": "assets/icons/icon128.png"
+  },
+  "offline_enabled": true,
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "background.full.js",
+        "scripts/background/background.full.js",
+        "assets/lib/ffmpeg.js",
+        "assets/lib/ffmpeg.min.js",
+        "assets/lib/ffmpeg-core.js",
+        "assets/lib/ffmpeg-core.wasm",
+        "assets/lib/ffmpeg-core.worker.js",
+        "assets/lib/ffmpeg-core-mt.js",
+        "assets/lib/ffmpeg-core-mt.wasm",
+        "assets/lib/ffmpeg-core-mt.worker.js",
+        "assets/lib/alass-wasm.js",
+        "assets/lib/alass.js",
+        "assets/lib/alass.wasm",
+        "assets/lib/ffsubsync-wasm.js",
+        "assets/lib/ffsubsync_wasm.js",
+        "assets/lib/ffsubsync_wasm_bg.wasm",
+        "assets/lib/whisper-main.js",
+        "assets/lib/ggml-tiny.en-q5_1.bin",
+        "assets/lib/vosk-browser.js",
+        "assets/models/vosk-model-small-en-us-0.15.tar.gz"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

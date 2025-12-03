@@ -1,0 +1,35 @@
+/* tslint:disable */
+/* eslint-disable */
+export const memory: WebAssembly.Memory;
+export const __wbg_ffsubsyncoptions_free: (a: number, b: number) => void;
+export const __wbg_ffsubsyncresult_free: (a: number, b: number) => void;
+export const __wbg_get_ffsubsyncoptions_frame_ms: (a: number) => number;
+export const __wbg_get_ffsubsyncoptions_gss: (a: number) => number;
+export const __wbg_get_ffsubsyncoptions_max_offset_ms: (a: number) => number;
+export const __wbg_get_ffsubsyncoptions_sample_rate: (a: number) => number;
+export const __wbg_get_ffsubsyncoptions_vad_aggressiveness: (a: number) => number;
+export const __wbg_get_ffsubsyncresult_confidence: (a: number) => number;
+export const __wbg_get_ffsubsyncresult_drift: (a: number) => number;
+export const __wbg_get_ffsubsyncresult_offset_ms: (a: number) => number;
+export const __wbg_get_ffsubsyncresult_segments_used: (a: number) => number;
+export const __wbg_get_ffsubsyncresult_srt: (a: number) => [number, number];
+export const __wbg_set_ffsubsyncoptions_frame_ms: (a: number, b: number) => void;
+export const __wbg_set_ffsubsyncoptions_gss: (a: number, b: number) => void;
+export const __wbg_set_ffsubsyncoptions_max_offset_ms: (a: number, b: number) => void;
+export const __wbg_set_ffsubsyncoptions_sample_rate: (a: number, b: number) => void;
+export const __wbg_set_ffsubsyncoptions_vad_aggressiveness: (a: number, b: number) => void;
+export const __wbg_set_ffsubsyncresult_confidence: (a: number, b: number) => void;
+export const __wbg_set_ffsubsyncresult_drift: (a: number, b: number) => void;
+export const __wbg_set_ffsubsyncresult_offset_ms: (a: number, b: number) => void;
+export const __wbg_set_ffsubsyncresult_segments_used: (a: number, b: number) => void;
+export const __wbg_set_ffsubsyncresult_srt: (a: number, b: number, c: number) => void;
+export const align_pcm: (a: number, b: number, c: any, d: number, e: number) => [number, number, number];
+export const align_wav: (a: number, b: number, c: any, d: number, e: number) => [number, number, number];
+export const ffsubsyncoptions_new: () => number;
+export const ffsubsyncresult_new: () => number;
+export const __wbindgen_malloc: (a: number, b: number) => number;
+export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
+export const __wbindgen_externrefs: WebAssembly.Table;
+export const __externref_table_dealloc: (a: number) => void;
+export const __wbindgen_free: (a: number, b: number, c: number) => void;
+export const __wbindgen_start: () => void;

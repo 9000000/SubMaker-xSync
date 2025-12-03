@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SubMaker xSync Settings</title>
+  <link rel="icon" type="image/png" href="../../assets/icons/icon48.png">
+  <script src="../../scripts/shared/theme-boot.js"></script>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <div class="bg-decoration">
+    <div class="bg-blob bg-blob-1"></div>
+    <div class="bg-blob bg-blob-2"></div>
+  </div>
+
+  <div class="shell">
+    <header class="hero">
+      <div class="brand">
+        <div class="brand-logo">
+          <img src="../../assets/icons/icon128.png" alt="SubMaker xSync logo">
+        </div>
+        <div>
+          <h1 id="heroTitle">SubMaker xSync</h1>
+          <p class="subline" id="heroSubtitle">Settings & Configuration</p>
+        </div>
+      </div>
+      
+      <div class="header-actions">
+        <div class="badge-stack">
+          <span class="pill version">v<span id="versionBadge"></span></span>
+        </div>
+        <button class="theme-toggle" id="themeToggle" aria-label="__MSG_xsync_options_themeToggleAria__">
+          <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="5"></circle>
+              <line x1="12" y1="1" x2="12" y2="3"></line>
+              <line x1="12" y1="21" x2="12" y2="23"></line>
+              <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+              <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+              <line x1="1" y1="12" x2="3" y2="12"></line>
+              <line x1="21" y1="12" x2="23" y2="12"></line>
+              <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+              <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+          </svg>
+          <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+          </svg>
+          <svg class="icon-blackhole" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"></circle>
+              <circle cx="12" cy="12" r="4"></circle>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <section class="grid quick-stats">
+      <div class="stat-chip">
+        <span class="dot idle" id="statusDot"></span>
+        <div>
+          <p class="label" id="statusLabelTitle">Status</p>
+          <p class="value" id="statusLabel">Checking...</p>
+        </div>
+      </div>
+      <div class="stat-chip">
+        <span class="dot offline" id="configureDot"></span>
+        <div>
+          <p class="label" id="configureLabel">Configure</p>
+          <a class="value compact link-badge" id="configureBadge">Not captured</a>
+        </div>
+      </div>
+      <div class="stat-chip">
+        <span class="dot offline" id="toolboxDot"></span>
+        <div>
+          <p class="label" id="toolboxLabel">Toolbox</p>
+          <a class="value compact link-badge" id="toolboxBadge">Not captured</a>
+        </div>
+      </div>
+      <div class="stat-chip">
+        <span class="dot offline" id="lastSavedDot"></span>
+        <div>
+          <p class="label" id="lastSavedLabel">Last Save</p>
+          <p class="value" id="lastSaved">Not yet</p>
+        </div>
+      </div>
+    </section>
+
+    <form id="settingsForm" autocomplete="off" spellcheck="false">
+      <section class="card">
+        <div class="card-head">
+          <div>
+            <p class="eyebrow" id="generalEyebrow">General</p>
+            <h2 id="generalTitle">Global Behaviour</h2>
+          </div>
+        </div>
+        <div class="control-row">
+          <div>
+            <p class="label" id="autoSyncLabel">Auto Sync</p>
+            <p class="hint" id="autoSyncHint">Keep automatic syncing active whenever SubMaker is detected.</p>
+          </div>
+          <label class="toggle-switch">
+            <input type="checkbox" id="autoSync" autocomplete="off">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div class="control-grid">
+          <div class="field">
+            <label id="themePreferenceLabel">Theme Preference</label>
+            <div class="pill-row" id="themeChoice">
+              <label class="pill-select"><input type="radio" name="theme" value="light"><span id="themeLightLabel">Light</span></label>
+              <label class="pill-select"><input type="radio" name="theme" value="dark"><span id="themeDarkLabel">Dark</span></label>
+              <label class="pill-select"><input type="radio" name="theme" value="true-dark"><span id="themeTrueDarkLabel">True Dark</span></label>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <div>
+            <p class="eyebrow" id="syncEyebrow">Sync Behaviour</p>
+            <h2 id="syncTitle">Automation &amp; Safety</h2>
+          </div>
+        </div>
+        <div class="control-row">
+          <div>
+            <p class="label" id="preferAlassLabel">Prefer ALASS</p>
+            <p class="hint" id="preferAlassHint">Favour ALASS when available for higher-accuracy alignment.</p>
+          </div>
+          <label class="toggle-switch">
+            <input type="checkbox" id="preferAlass">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div class="control-grid">
+          <div class="field">
+            <label for="concurrencyLimit" id="concurrencyLabel">Concurrency</label>
+            <select id="concurrencyLimit">
+              <option value="1" id="concurrencyOption1">Single job</option>
+              <option value="2" id="concurrencyOption2">Up to 2 jobs</option>
+              <option value="3" id="concurrencyOption3">Up to 3 jobs</option>
+              <option value="4" id="concurrencyOption4">Up to 4 jobs</option>
+            </select>
+            <p class="hint" id="concurrencyHint">Prevent overload when multiple tabs sync at once.</p>
+          </div>
+          <div class="field">
+            <label for="fallbackBehavior" id="fallbackLabel">Fallback Behaviour</label>
+            <select id="fallbackBehavior">
+              <option value="retry" id="fallbackOptionRetry">Retry quietly</option>
+              <option value="manual" id="fallbackOptionManual">Prompt me</option>
+              <option value="skip" id="fallbackOptionSkip">Skip failed sync</option>
+            </select>
+            <p class="hint" id="fallbackHint">How to handle hiccups during background syncing.</p>
+          </div>
+          <div class="field">
+            <label id="quietModeLabel">Quiet Mode</label>
+            <div class="inline-row">
+              <label class="toggle-switch">
+                <input type="checkbox" id="quietMode">
+                <span class="toggle-slider"></span>
+              </label>
+              <span class="hint" id="quietModeHint">Pause automatic sync until re-enabled.</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <div>
+            <p class="eyebrow" id="integrationsEyebrow">Integrations</p>
+            <h2 id="integrationsTitle">SubMaker Link</h2>
+          </div>
+        </div>
+        <div class="control-grid">
+          <div class="control-row small">
+            <div>
+              <p class="label" id="detectPagesLabel">Detect SubMaker Pages</p>
+              <p class="hint" id="detectPagesHint">Listen for the sync page to auto-connect.</p>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="detectPages">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div class="control-row small">
+            <div>
+              <p class="label" id="offscreenLabel">Offscreen Worker</p>
+              <p class="hint" id="offscreenHint">Allow the offscreen document for processing.</p>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="offscreenEnabled">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <div>
+            <p class="eyebrow" id="notificationsEyebrow">Notifications</p>
+            <h2 id="notificationsTitle">Signals &amp; Quiet Hours</h2>
+          </div>
+        </div>
+        <div class="control-grid">
+          <div class="control-row small">
+            <div>
+              <p class="label" id="notifyStartLabel">On Start</p>
+              <p class="hint" id="notifyStartHint">Show a toast when a sync kicks off.</p>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="notifyStart">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div class="control-row small">
+            <div>
+              <p class="label" id="notifySuccessLabel">On Success</p>
+              <p class="hint" id="notifySuccessHint">Celebrate when a sync finishes.</p>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="notifySuccess">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div class="control-row small">
+            <div>
+              <p class="label" id="notifyErrorLabel">On Error</p>
+              <p class="hint" id="notifyErrorHint">Surface issues immediately.</p>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="notifyError">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div class="control-row small">
+            <div>
+              <p class="label" id="notifySoundLabel">Sounds</p>
+              <p class="hint" id="notifySoundHint">Play subtle cues with notifications.</p>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="notifySound">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div class="control-row small">
+            <div>
+              <p class="label" id="quietHoursLabel">Quiet Hours</p>
+              <p class="hint" id="quietHoursHint">Mute notifications during a window.</p>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="quietHours">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+        </div>
+        <div class="control-grid">
+          <div class="field">
+            <label for="quietStart" id="quietStartLabel">Quiet Start</label>
+            <input type="time" id="quietStart" autocomplete="off">
+          </div>
+          <div class="field">
+            <label for="quietEnd" id="quietEndLabel">Quiet End</label>
+            <input type="time" id="quietEnd">
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <div>
+            <p class="eyebrow" id="supportEyebrow">Support &amp; Data</p>
+            <h2 id="supportTitle">Backups, Resets, Diagnostics</h2>
+          </div>
+        </div>
+        <div class="button-grid">
+          <button type="button" class="btn ghost" id="exportBtn">Export Settings</button>
+          <button type="button" class="btn ghost" id="importBtn">Import Settings</button>
+          <button type="button" class="btn subtle" id="clearStatsBtn">Reset Stats</button>
+          <button type="button" class="btn subtle" id="resetBtn">Reset to Defaults</button>
+        </div>
+        <p class="hint" id="supportHint">Exports are JSON. Stats reset only clears popup metrics (active/total).</p>
+      </section>
+
+      <div class="action-bar">
+        <div>
+          <p class="eyebrow" id="saveEyebrow">Save</p>
+          <p class="subline" id="saveSubline">Applies instantly across the extension.</p>
+        </div>
+        <button type="submit" class="btn primary" id="saveBtn">Save Settings</button>
+      </div>
+    </form>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <input type="file" id="importFile" accept="application/json" hidden>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>
