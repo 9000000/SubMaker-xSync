@@ -1,6 +1,6 @@
 # SubMaker xSync
 
-SubMaker xSync is a Chrome/Edge (MV3) companion extension for the SubMaker Stremio addon. It keeps your subtitles aligned automatically by extracting audio from SubMaker pages, syncing subtitles with FFmpeg/ALASS/ffsubsync, and exposing quick controls via the popup and options pages.
+SubMaker xSync is a Chrome/Edge (MV3) companion extension for the SubMaker Stremio addon. It helps your Subtitles workflows by extracting audio from Stremio streams, syncing subtitles with FFmpeg/ALASS/ffsubsync, and exposing quick controls via the popup and options pages.
 
 ## Features
 - Automatic subtitle sync when SubMaker pages are detected (config, toolbox, sync page)
@@ -8,7 +8,6 @@ SubMaker xSync is a Chrome/Edge (MV3) companion extension for the SubMaker Strem
 - Popup dashboard with live status, quick links, and factory-reset
 - Options page for auto-sync, ALASS preference, concurrency, fallback behaviour, quiet mode, notifications, and link capture
 - Offscreen document pipeline for media processing and chunked result transfer
-- Localization: English and Spanish
 
 ## Install (Load Unpacked)
 1. Open `chrome://extensions` (or Edge: `edge://extensions`) and enable **Developer mode**.
@@ -16,7 +15,7 @@ SubMaker xSync is a Chrome/Edge (MV3) companion extension for the SubMaker Strem
 3. Open the popup to verify the version and status; capture your SubMaker Configure/Toolbox links once so xSync remembers them.
 
 ## Permissions
-- `storage`, `offscreen`
+- `storage`, `offscreen`;
 - Host access: `http://*/*`, `https://*/*` (needed to detect SubMaker pages and exchange data)
 
 ## How It Works
