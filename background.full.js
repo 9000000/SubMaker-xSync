@@ -46,6 +46,8 @@ let _alassApi = null;
 let _ffsubsyncReady = false;
 let _ffsubsyncApi = null;
 let _offscreenCreated = false;
+let _offscreenReady = false;
+let _offscreenReadyPromise = null;
 let _offscreenActive = 0;
 let _offscreenCleanupTimer = null;
 const _offscreenResultChunks = new Map();
@@ -58,8 +60,67 @@ function logOffscreenLifecycle(event, extra = {}) {
   console.log('[Background][Offscreen]', event, {
     ...extra,
     created: _offscreenCreated,
+    ready: _offscreenReady,
     active: _offscreenActive
   });
+}
+
+function pingOffscreen(timeoutMs = 2000) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error('Offscreen ping timed out'));
+    }, timeoutMs);
+    try {
+      chrome.runtime.sendMessage({ type: 'OFFSCREEN_PING' }, (resp) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (chrome.runtime.lastError) {
+          return reject(new Error(chrome.runtime.lastError.message));
+        }
+        if (resp?.ok) return resolve(true);
+        reject(new Error('Offscreen ping failed'));
+      });
+    } catch (err) {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      }
+    }
+  });
+}
+
+async function waitForOffscreenReady(force = false, timeoutMs = 6000) {
+  if (_offscreenReady && !force) return true;
+  if (_offscreenReadyPromise) {
+    return _offscreenReadyPromise;
+  }
+  const started = Date.now();
+  let attempt = 0;
+  _offscreenReadyPromise = (async () => {
+    while (Date.now() - started < timeoutMs) {
+      attempt += 1;
+      try {
+        await pingOffscreen();
+        _offscreenReady = true;
+        return true;
+      } catch (err) {
+        _offscreenReady = false;
+        if (Date.now() - started >= timeoutMs) throw err;
+        await new Promise((r) => setTimeout(r, 150 * attempt));
+      }
+    }
+    throw new Error('Offscreen did not respond to ping');
+  })();
+  try {
+    return await _offscreenReadyPromise;
+  } finally {
+    _offscreenReadyPromise = null;
+  }
 }
 
 function stashResultChunk(transferId, chunkIndex, totalChunks, chunkArray, expectedBytes) {
@@ -303,6 +364,36 @@ async function loadWorkerScript(url) {
   importScripts(url);
 }
 
+// Defensive helper: try importScripts first, then fall back to fetch + Blob if parsing fails
+async function importScriptSafe(url, label = '') {
+  if (!url) throw new Error('Missing script URL');
+  const display = label || url;
+  try {
+    importScripts(url);
+    return true;
+  } catch (err) {
+    console.warn(`[Background] importScripts failed for ${display}:`, err?.message || err);
+  }
+  try {
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    const code = await res.text();
+    const blobUrl = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+    try {
+      importScripts(blobUrl);
+      console.log(`[Background] Loaded ${display} via fetch fallback`);
+      return true;
+    } finally {
+      URL.revokeObjectURL(blobUrl);
+    }
+  } catch (err2) {
+    console.error(`[Background] Fallback import failed for ${display}:`, err2?.message || err2);
+    const enriched = new Error(`Failed to load ${display}: ${err2?.message || err2}`);
+    enriched.cause = err2;
+    throw enriched;
+  }
+}
+
 /**
  * Ensure FFmpeg factory (createFFmpeg) is available without depending on CDN.
  */
@@ -331,13 +422,13 @@ async function ensureFfmpegFactory() {
         if (typeof window === 'undefined' || !self.window) {
           self.window = self;
         }
-        importScripts(url);
+        await importScriptSafe(url, label || url);
       } else {
         if (typeof document === 'undefined' && !self.document) {
           // Some FFmpeg builds expect document to exist; stub it for worker context.
           self.document = { baseURI: self.location?.href || '', currentScript: null };
         }
-        await loadWorkerScript(url);
+        await importScriptSafe(url, label || url);
       }
       factory = self.createFFmpeg || (self.FFmpeg && self.FFmpeg.createFFmpeg) || wireUpWasmShim();
       if (factory) {
@@ -373,7 +464,7 @@ async function ensureTransferHelper() {
   if (typeof importScripts !== 'function') {
     throw new Error('IDB transfer helper unavailable (no importScripts)');
   }
-  importScripts(url);
+  await importScriptSafe(url, 'idb-transfer.js');
   if (!self.SubMakerTransfer) {
     throw new Error('IDB transfer helper failed to load');
   }
@@ -397,7 +488,7 @@ async function ensureWhisperModule(ctx = null) {
         if (typeof importScripts !== 'function') {
           throw new Error('Whisper loader unavailable (no importScripts)');
         }
-        importScripts(WHISPER_JS_URL);
+        return importScriptSafe(WHISPER_JS_URL, 'whisper-main.js');
         _whisperPreloaded = true;
       };
 
@@ -429,9 +520,9 @@ async function ensureWhisperModule(ctx = null) {
         if (_whisperPreloaded && !isModuleReady()) {
           console.warn('[Background] Whisper preloaded but bindings missing; reloading script');
           if (ctx?.tabId) sendDebugLog(ctx.tabId, ctx.messageId, 'Whisper bindings missing; reloading whisper-main.js', 'warn');
-          loadWhisperScript();
+          await loadWhisperScript();
         } else if (!_whisperPreloaded) {
-          loadWhisperScript();
+          await loadWhisperScript();
         }
 
         if (!isModuleReady()) {
@@ -1561,17 +1652,23 @@ async function tryExtractDashTextTracks(mpdUrl, tabId, messageId) {
     const baseMatch = text.match(/<BaseURL>([^<]+)<\/BaseURL>/i);
     const baseUrl = baseMatch ? baseMatch[1].trim() : '';
 
-    const adaptationRegex = /<AdaptationSet[^>]*mimeType="([^"]+)"[^>]*>([\s\S]*?)<\/AdaptationSet>/gi;
+    const adaptationRegex = /<AdaptationSet([^>]*)>([\s\S]*?)<\/AdaptationSet>/gi;
     let adaptation;
     while ((adaptation = adaptationRegex.exec(text)) !== null) {
-      const mime = adaptation[1] || '';
+      const attrs = adaptation[1] || '';
       const body = adaptation[2] || '';
+      const mimeMatch = attrs.match(/mimeType="([^"]+)"/i);
+      const mime = mimeMatch ? mimeMatch[1] : '';
+      const adaptLang = normalizeTrackLanguageCode((attrs.match(/\blang="([^"]+)"/i) || [])[1]);
+      const adaptLabel = (attrs.match(/\blabel="([^"]+)"/i) || [])[1];
       if (!/vtt|ttml|webvtt|text\/vtt/i.test(mime)) continue;
 
       const repRegex = /<Representation[^>]*>([\s\S]*?)<\/Representation>/gi;
       let rep;
       while ((rep = repRegex.exec(body)) !== null) {
         const repBody = rep[1] || '';
+        const repLang = normalizeTrackLanguageCode((repBody.match(/\blang="([^"]+)"/i) || [])[1]) || adaptLang || 'und';
+        const repLabel = (repBody.match(/\blabel="([^"]+)"/i) || [])[1] || adaptLabel || 'DASH subtitle';
         const repBaseMatch = repBody.match(/<BaseURL>([^<]+)<\/BaseURL>/i);
         const repBase = repBaseMatch ? repBaseMatch[1].trim() : '';
         const url = repBase || baseUrl;
@@ -1579,17 +1676,17 @@ async function tryExtractDashTextTracks(mpdUrl, tabId, messageId) {
         const abs = new URL(url, mpdUrl).toString();
         if (abs.endsWith('.vtt') || abs.includes('.vtt?')) {
           const vtt = await (await safeFetch(abs)).text();
-          tracks.push({ id: String(tracks.length), label: repBase || 'DASH VTT', language: 'und', codec: 'vtt', content: convertVttToSrt(vtt) });
+          tracks.push({ id: String(tracks.length), label: repBase || repLabel || 'DASH VTT', language: repLang, codec: 'vtt', content: convertVttToSrt(vtt) });
         } else if (abs.endsWith('.srt') || abs.includes('.srt?')) {
           const srt = await (await safeFetch(abs)).text();
-          tracks.push({ id: String(tracks.length), label: repBase || 'DASH SRT', language: 'und', codec: 'srt', content: srt });
+          tracks.push({ id: String(tracks.length), label: repBase || repLabel || 'DASH SRT', language: repLang, codec: 'srt', content: srt });
         }
       }
     }
 
     if (tracks.length) {
       sendExtractProgress(tabId, messageId, 20, `Found ${tracks.length} text track(s) in DASH`);
-      return tracks;
+      return applyContentLanguageGuesses(tracks);
     }
   } catch (err) {
     console.warn('[Background] DASH text track parse failed:', err?.message);
@@ -1606,15 +1703,24 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
   const extractionMode = normalizedMode;
   const baseHeaders = mergeHeaders(null, hints?.pageHeaders || null);
   console.log('[Background] extractEmbeddedSubtitles for host:', hostLabel, 'mode:', extractionMode);
+  const applyLangHints = (tracks, langHints) => {
+    const withHints = (!langHints || !langHints.length)
+      ? (tracks || [])
+      : applyHeaderLanguagesToTracks(tracks, langHints);
+    return applyContentLanguageGuesses(withHints);
+  };
 
   // Simple path: direct subtitle file
   if (lowerUrl.endsWith('.srt') || lowerUrl.includes('.srt?')) {
     const text = await (await safeFetch(streamUrl, baseHeaders ? { headers: baseHeaders } : undefined)).text();
-    return [{ id: '0', label: 'Subtitle file', language: 'und', codec: 'srt', content: text }];
+    const langGuess = detectLanguageFromContent(text) || 'und';
+    return [{ id: '0', label: 'Subtitle file', language: langGuess, codec: 'srt', content: text }];
   }
   if (lowerUrl.endsWith('.vtt') || lowerUrl.includes('.vtt?')) {
     const text = await (await safeFetch(streamUrl, baseHeaders ? { headers: baseHeaders } : undefined)).text();
-    return [{ id: '0', label: 'WebVTT file', language: 'und', codec: 'vtt', content: convertVttToSrt(text) }];
+    const asSrt = convertVttToSrt(text);
+    const langGuess = detectLanguageFromContent(asSrt) || 'und';
+    return [{ id: '0', label: 'WebVTT file', language: langGuess, codec: 'vtt', content: asSrt }];
   }
 
   const isHls = hints.isHls === true || /\.m3u8(\?|$)/i.test(lowerUrl);
@@ -1661,7 +1767,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
     if (isHls) {
       sendExtractProgress(tabId, messageId, 4, `${modeLabel}: loading text tracks via video element...`);
       try {
-        const videoTracks = await extractSubtitlesViaVideoOffscreen(streamUrl, extractionMode, messageId, tabId);
+        const videoTracks = applyLangHints(await extractSubtitlesViaVideoOffscreen(streamUrl, extractionMode, messageId, tabId));
         const { summary } = evaluateTracks(videoTracks, null, false, 'video extraction');
         const lastCueText = summary?.lastCueSec ? `; last cue at ${Math.round(summary.lastCueSec)}s` : '';
         sendExtractProgress(tabId, messageId, 100, `${modeLabel}: extracted ${videoTracks.length} track(s) via video${lastCueText}`);
@@ -1693,7 +1799,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
     sendDebugLog(tabId, messageId, `${modeLabel}: sample ready (~${sampleMb} MB, partial=${sample?.partial ? 'yes' : 'no'})`, 'info');
     sendExtractProgress(tabId, messageId, 75, `${modeLabel}: demuxing sample...`);
     try {
-      const tracks = await demuxSubtitlesOffscreen(buffer, messageId, tabId);
+    const tracks = applyLangHints(await demuxSubtitlesOffscreen(buffer, messageId, tabId), sample?.subtitleLangs);
       const durationSec = sample?.durationSec || probeContainerDuration(buffer) || null;
       const { summary } = evaluateTracks(tracks, durationSec, sample?.partial === true, 'demux');
       const lastCueText = summary?.lastCueSec ? `; last cue at ${Math.round(summary.lastCueSec)}s` : '';
@@ -1714,7 +1820,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
     const fullMb = Math.round((fullBytes / (1024 * 1024)) * 10) / 10;
     sendDebugLog(tabId, messageId, `Complete: fetched full stream (~${fullMb || '?'} MB). Demuxing...`, 'info');
     sendExtractProgress(tabId, messageId, 95, 'Complete: demuxing full stream...');
-    const tracks = await demuxSubtitlesOffscreen(fullBuffer, messageId, tabId);
+    const tracks = applyLangHints(await demuxSubtitlesOffscreen(fullBuffer, messageId, tabId), full?.subtitleLangs || hints?.subtitleLangs);
     if (!tracks || !tracks.length) {
       throw new Error('Complete demux returned no tracks');
     }
@@ -1729,7 +1835,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
   console.log('[Background] Attempting video-based subtitle extraction (primary method)...');
   sendExtractProgress(tabId, messageId, 5, 'Loading video for subtitle extraction...');
   try {
-    const videoTracks = await extractSubtitlesViaVideoOffscreen(streamUrl, extractionMode, messageId, tabId);
+    const videoTracks = applyLangHints(await extractSubtitlesViaVideoOffscreen(streamUrl, extractionMode, messageId, tabId));
     if (videoTracks && videoTracks.length > 0) {
       console.log(`[Background] Video-based extraction succeeded: ${videoTracks.length} track(s)`);
       sendExtractProgress(tabId, messageId, 100, `Extracted ${videoTracks.length} track(s) via video element`);
@@ -1772,6 +1878,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
   console.log('[Background] Delegating demux to offscreen document...');
   try {
     let tracks = await demuxSubtitlesOffscreen(buffer, messageId, tabId);
+    tracks = applyLangHints(tracks, sample?.subtitleLangs);
     if (!tracks || !tracks.length) {
       throw new Error('FFmpeg demux returned no tracks');
     }
@@ -1780,7 +1887,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
     if (flatCueStarts || nonMonotonicCues) {
       sendDebugLog(tabId, messageId, `Detected ${flatCueStarts ? 'flat' : 'non-monotonic'} cue timestamps after demux; retrying via video element fallback...`, 'warn');
       try {
-        const safeTracks = await extractSubtitlesViaVideoOffscreen(streamUrl, 'smart', messageId, tabId);
+        const safeTracks = applyLangHints(await extractSubtitlesViaVideoOffscreen(streamUrl, 'smart', messageId, tabId));
         if (safeTracks?.length) {
           sendDebugLog(tabId, messageId, 'Video fallback succeeded; returning re-extracted tracks.', 'info');
           return safeTracks;
@@ -1819,7 +1926,8 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
         sendDebugLog(tabId, messageId, `Coverage looks short (last cue ${lastCueSec || 'n/a'}s vs duration ${durationSec || 'n/a'}s); fetching tail slice (~${Math.round(tailBytes / (1024 * 1024))} MB) to merge...`, 'warn');
         const tail = await fetchTailSample(streamUrl, tailBytes, (p) => sendExtractProgress(tabId, messageId, Math.min(88, 76 + Math.round(p * 0.06)), 'Fetching tail slice to complete subtitles...'), baseHeaders);
         const combined = concatBuffers(buffer, tail.buffer);
-        const combinedTracks = await demuxSubtitlesOffscreen(combined, messageId, tabId);
+        let combinedTracks = await demuxSubtitlesOffscreen(combined, messageId, tabId);
+        combinedTracks = applyLangHints(combinedTracks, sample?.subtitleLangs || tail?.subtitleLangs);
         const combinedSummary = summarizeTracks(combinedTracks);
         const improved = (combinedSummary.lastCueSec && (!lastCueSec || combinedSummary.lastCueSec > lastCueSec + 30)) ||
           (combinedSummary.minTrackSize > minTrackSize);
@@ -1872,7 +1980,8 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
 
       buffer = sample?.buffer || sample;
       sampleBytes = buffer?.byteLength || sampleBytes;
-      const retryTracks = await demuxSubtitlesOffscreen(buffer, messageId, tabId);
+      let retryTracks = await demuxSubtitlesOffscreen(buffer, messageId, tabId);
+      retryTracks = applyLangHints(retryTracks, sample?.subtitleLangs);
       const summary = summarizeTracks(retryTracks);
       const sizeUnchanged = summary.minTrackSize === prevSize;
       stableSizeFetches = sizeUnchanged ? stableSizeFetches + 1 : 0;
@@ -1955,7 +2064,8 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
           const expandedBytes = expanded?.buffer?.byteLength || 0;
           const expandedMb = Math.round((expandedBytes / (1024 * 1024)) * 10) / 10;
           sendDebugLog(tabId, messageId, `Retrying demux with expanded sample (~${expandedMb} MB)...`, 'info');
-          const expandedTracks = await demuxSubtitlesOffscreen(expanded.buffer, messageId, tabId);
+          let expandedTracks = await demuxSubtitlesOffscreen(expanded.buffer, messageId, tabId);
+          expandedTracks = applyLangHints(expandedTracks, expanded?.subtitleLangs || sample?.subtitleLangs);
           const { minTrackSize: expandedMin } = summarizeTracks(expandedTracks);
           if (expandedMin >= 20 * 1024) {
             console.log(`[Background] Expanded sample succeeded (${Math.round(expandedMin / 1024)}KB per track)`);
@@ -1980,7 +2090,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
         const fullBuf = await fullRes.arrayBuffer();
         const fullMb = Math.round((fullBuf.byteLength / (1024 * 1024)) * 10) / 10;
         sendDebugLog(tabId, messageId, `Retrying demux with full stream (~${fullMb} MB)...`, 'info');
-        const fullTracks = await demuxSubtitlesOffscreen(fullBuf, messageId, tabId);
+        const fullTracks = applyLangHints(await demuxSubtitlesOffscreen(fullBuf, messageId, tabId), sample?.subtitleLangs);
         const { minTrackSize: fullMin, lastCueSec: fullLast } = summarizeTracks(fullTracks);
         const improved = (durationSuggestsTruncation && fullLast && (!lastCueSec || fullLast > lastCueSec)) || fullMin >= minTrackSize;
         if (improved) {
@@ -2431,7 +2541,7 @@ async function ensureVoskModel(ctx = null) {
   if (voskModelPromise) return voskModelPromise;
   voskModelPromise = (async () => {
     if (!self.Vosk) {
-      importScripts(VOSK_JS_URL);
+      await importScriptSafe(VOSK_JS_URL, 'vosk-browser.js');
     }
     if (!self.Vosk || typeof self.Vosk.createModel !== 'function') {
       throw new Error('Vosk library unavailable');
@@ -3406,18 +3516,30 @@ function readEbmlElement(u8, offset, limit) {
   if (offset >= limit) return null;
   const idInfo = readVint(u8, offset);
   if (!idInfo) return null;
+  // For element IDs, keep the raw bytes (marker bits included) to match EBML constants.
+  let idRaw = 0;
+  for (let i = 0; i < idInfo.length; i++) {
+    idRaw = (idRaw << 8) | u8[offset + i];
+  }
   const sizeInfo = readVint(u8, offset + idInfo.length);
   if (!sizeInfo) return null;
   const dataStart = offset + idInfo.length + sizeInfo.length;
   let size = sizeInfo.value;
+  // Unknown-size EBML elements set all size bits; treat as consuming the remaining scan window
   if (size === (Math.pow(2, 7 * sizeInfo.length) - 1)) {
-    return null; // unknown size, skip
+    size = Math.max(0, limit - dataStart);
   }
-  const dataEnd = dataStart + size;
-  if (dataEnd > limit) return null;
+  let dataEnd = dataStart + size;
+  if (dataEnd > limit) {
+    // When scanning partial buffers (e.g., HTTP byte ranges), large/unknown sizes can exceed our window.
+    // Cap to the available bytes so we can still walk nested header elements like Tracks.
+    dataEnd = limit;
+    size = Math.max(0, dataEnd - dataStart);
+  }
+  if (dataStart >= limit) return null;
   return {
-    id: idInfo.value,
-    idHex: idInfo.value.toString(16).toUpperCase(),
+    id: idRaw >>> 0,
+    idHex: (idRaw >>> 0).toString(16).toUpperCase(),
     size,
     header: idInfo.length + sizeInfo.length,
     dataStart,
@@ -3455,8 +3577,8 @@ function parseMkvHeaderInfo(buffer, opts = {}) {
     TRACK_NUMBER: 'D7',
     TRACK_TYPE: '83',
     TRACK_NAME: '536E',
-    TRACK_LANGUAGE: '22B59C',
-    TRACK_LANGUAGE_OLD: '86', // fallback
+    TRACK_LANGUAGE: '22B59C',       // RFC 1766 / ISO-639-2
+    TRACK_LANGUAGE_IETF: '22B59D',  // RFC 5646 (modern)
     CODEC_ID: '86',
     ATTACHMENTS: '1941A469',
     ATTACHED_FILE: '61A7',
@@ -3534,15 +3656,19 @@ function parseMkvHeaderInfo(buffer, opts = {}) {
   function parseTracks(el) {
     walk(el.dataStart, Math.min(el.dataEnd, limit), {
       [ID.TRACK_ENTRY]: (tEl) => {
-        const track = { number: null, type: null, name: '', language: '', codecId: '' };
+        const track = { number: null, type: null, name: '', language: '', languageIetf: '', codecId: '' };
         walk(tEl.dataStart, Math.min(tEl.dataEnd, limit), {
           [ID.TRACK_NUMBER]: (nEl) => { track.number = parseUint(u8, nEl.dataStart, nEl.dataEnd); },
           [ID.TRACK_TYPE]: (tEl2) => { track.type = parseUint(u8, tEl2.dataStart, tEl2.dataEnd); },
           [ID.TRACK_NAME]: (nEl) => { track.name = parseString(u8, nEl.dataStart, nEl.dataEnd); },
           [ID.TRACK_LANGUAGE]: (lEl) => { track.language = parseString(u8, lEl.dataStart, lEl.dataEnd); },
-          [ID.TRACK_LANGUAGE_OLD]: (lEl) => { if (!track.language) track.language = parseString(u8, lEl.dataStart, lEl.dataEnd); },
+          [ID.TRACK_LANGUAGE_IETF]: (lEl) => { track.languageIetf = parseString(u8, lEl.dataStart, lEl.dataEnd); },
           [ID.CODEC_ID]: (cEl) => { track.codecId = parseString(u8, cEl.dataStart, cEl.dataEnd); }
         });
+        // Prefer modern IETF tag when present
+        if (track.languageIetf && !track.language) {
+          track.language = track.languageIetf;
+        }
         info.tracks.push(track);
       }
     });
@@ -4455,6 +4581,7 @@ async function closeOffscreenDocumentSafe() {
       const hasDoc = await chrome.offscreen.hasDocument();
       if (!hasDoc) {
         _offscreenCreated = false;
+        _offscreenReady = false;
         return;
       }
     }
@@ -4466,6 +4593,7 @@ async function closeOffscreenDocumentSafe() {
     console.warn('[Background] Failed to close offscreen document:', err?.message || err);
   } finally {
     _offscreenCreated = false;
+    _offscreenReady = false;
     logOffscreenLifecycle('close:finish');
   }
 }
@@ -4476,12 +4604,14 @@ async function forceCloseOffscreenDocument(reason = 'force-close') {
     clearTimeout(_offscreenCleanupTimer);
     _offscreenCleanupTimer = null;
   }
+  _offscreenReady = false;
   _offscreenActive = 0;
   try {
     if (chrome.offscreen?.hasDocument) {
       const hasDoc = await chrome.offscreen.hasDocument();
       if (!hasDoc) {
         _offscreenCreated = false;
+        _offscreenReady = false;
         logOffscreenLifecycle('force-close:finish', { reason, existed: false });
         return;
       }
@@ -4501,9 +4631,38 @@ async function forceCloseOffscreenDocument(reason = 'force-close') {
 /**
  * Ensure offscreen document exists for FFmpeg work (Worker support).
  */
-async function ensureOffscreenDocument() {
-  if (_offscreenCreated) return;
-  logOffscreenLifecycle('ensure:start');
+async function ensureOffscreenDocument(forceVerify = false) {
+  // Validate the cached flag; Chrome can drop the offscreen document without warning.
+  if (_offscreenCreated || forceVerify) {
+    try {
+      if (chrome.offscreen?.hasDocument) {
+        const hasDoc = await chrome.offscreen.hasDocument();
+        if (hasDoc) {
+          _offscreenCreated = true;
+          try {
+            await waitForOffscreenReady(forceVerify);
+            if (!forceVerify) return;
+            console.log('[Background] Offscreen document already present (reusing)');
+            logOffscreenLifecycle('ensure:reuse');
+            return;
+          } catch (pingErr) {
+            console.warn('[Background] Offscreen document present but unresponsive; recreating', pingErr?.message || pingErr);
+            _offscreenCreated = false;
+            _offscreenReady = false;
+          }
+        }
+        console.warn('[Background] Offscreen document flag set but hasDocument=false; recreating');
+        logOffscreenLifecycle('ensure:stale');
+        _offscreenCreated = false;
+        _offscreenReady = false;
+      } else if (_offscreenCreated && !forceVerify) {
+        return;
+      }
+    } catch (checkErr) {
+      console.warn('[Background] Failed to verify offscreen document state:', checkErr?.message || checkErr);
+    }
+  }
+  logOffscreenLifecycle('ensure:start', { forceVerify });
   try {
     if (chrome.offscreen?.hasDocument) {
       const hasDoc = await chrome.offscreen.hasDocument();
@@ -4521,14 +4680,18 @@ async function ensureOffscreenDocument() {
       justification: 'Run FFmpeg demux in a Worker-capable context'
     });
     _offscreenCreated = true;
+    _offscreenReady = false;
     console.log('[Background] Offscreen document created for FFmpeg demux');
     logOffscreenLifecycle('ensure:created');
+    await waitForOffscreenReady(true);
   } catch (err) {
     const msg = err?.message || '';
     if (msg.includes('already exists') || msg.includes('Only a single offscreen document')) {
       _offscreenCreated = true;
+      _offscreenReady = false;
       console.log('[Background] Offscreen document already exists; will reuse existing document');
       logOffscreenLifecycle('ensure:exists');
+      await waitForOffscreenReady(forceVerify);
       return;
     }
     console.warn('[Background] Failed to create offscreen document:', msg || err);
@@ -4558,6 +4721,11 @@ const OFFSCREEN_CHUNK_BYTES = 128 * 1024; // chunk size for large buffers to off
 function isMessageLengthError(err) {
   const msg = err?.message || '';
   return msg.includes('Message length exceeded') || msg.includes('maximum allowed length');
+}
+
+function isMissingOffscreenReceiver(err) {
+  const msg = err?.message || '';
+  return /receiving end does not exist|could not establish connection/i.test(msg);
 }
 
 async function sendBufferToOffscreenInChunks(uintPayload, messageId, tabId) {
@@ -4674,7 +4842,7 @@ const TRACK_LANG_NORMALIZE_MAP = {
   eng: 'en', enu: 'en', enus: 'en', enn: 'en', enuk: 'en', en_gb: 'en', en_gb: 'en', enus: 'en', engb: 'en', enau: 'en', enze: 'en',
   spa: 'es', esl: 'es', esu: 'es', esp: 'es', espanol: 'es', spn: 'es', es419: 'es', lat: 'es', latam: 'es', castellano: 'es',
   por: 'por', pt: 'por', porpt: 'por', pt_pt: 'por',
-  pob: 'pob', pb: 'pob', ptb: 'pob', ptbr: 'pob', pt-br: 'pob', porbr: 'pob', brazpor: 'pob', brazilian: 'pob',
+  pob: 'pob', pb: 'pob', ptb: 'pob', ptbr: 'pob', 'pt-br': 'pob', porbr: 'pob', brazpor: 'pob', brazilian: 'pob',
   fre: 'fr', fra: 'fr', frf: 'fr', frca: 'fr', frfr: 'fr',
   ger: 'de', deu: 'de', gerde: 'de',
   ita: 'it', itb: 'it',
@@ -4841,7 +5009,13 @@ const LANGUAGE_NAME_ALIASES = {
 
 function normalizeTrackLanguageCode(raw) {
   if (!raw) return null;
-  const cleaned = String(raw).trim().toLowerCase().replace(/[^a-z-]/g, '');
+  const rawStr = String(raw).trim().toLowerCase();
+  if (/^extracte/.test(rawStr)) return null;
+  if (/^extracted[_\s-]?sub/.test(rawStr)) return null;
+  if (/^remux[_\s-]?sub/.test(rawStr)) return null;
+  if (/^track\s*\d+/.test(rawStr)) return null;
+  if (/^subtitle\s*\d+/.test(rawStr)) return null;
+  const cleaned = rawStr.replace(/[^a-z-]/g, '');
   if (!cleaned) return null;
   const base = cleaned.split('-')[0];
   if (!base) return null;
@@ -4856,6 +5030,11 @@ function normalizeTrackLanguageCode(raw) {
 function detectLanguageFromLabel(label) {
   if (!label) return null;
   const lowered = String(label).toLowerCase();
+  if (/^extracte/.test(lowered)) return null;
+  if (/^extracted[_\s-]?sub/.test(lowered)) return null;
+  if (/^remux[_\s-]?sub/.test(lowered)) return null;
+  if (/^track\s+\d+/.test(lowered)) return null;
+  if (/^subtitle\s+\d+/.test(lowered)) return null;
   if (lowered.includes('brazil')) return 'pob';
   if (lowered.includes('portuguese (br')) return 'pob';
   const codeMatch = lowered.match(/(?:^|\[|\(|\s)([a-z]{2,3})(?:\s|$|\]|\))/);
@@ -4876,31 +5055,231 @@ function detectLanguageFromLabel(label) {
   return null;
 }
 
-function collectSubtitleLanguagesFromHeader(buffer) {
+function detectLanguageFromContent(text) {
+  if (!text || typeof text !== 'string') return null;
+  const sample = text.slice(0, 48000);
+  const cyrillicLetters = (sample.match(/[\u0400-\u04FF]/g) || []).length;
+  const latinLetters = (sample.match(/[A-Za-z\u00C0-\u024F]/g) || []).length;
+  if (cyrillicLetters > 24 && cyrillicLetters >= latinLetters * 0.15) return 'ru';
+
+  const cleaned = sample
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&[a-z]+;/gi, ' ')
+    .replace(/\d{2}:\d{2}:\d{2}[,\.]\d{3}\s+-->\s+\d{2}:\d{2}:\d{2}[,\.]\d{3}/g, ' ')
+    .replace(/\d+\s*\n\d{2}:\d{2}:\d{2}[^\n]*-->[^\n]+/g, ' ')
+    .replace(/[^A-Za-z\u00C0-\u024F]+/g, ' ')
+    .toLowerCase();
+  const normalized = cleaned.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const words = normalized.split(/\s+/).filter((w) => w.length > 1);
+  if (!words.length) return null;
+  const totalWords = words.length;
+  const counts = {};
+  for (const w of words) counts[w] = (counts[w] || 0) + 1;
+
+  const STOPWORDS = {
+    en: ['the', 'and', 'you', 'that', 'this', 'for', 'with', 'not', 'have', 'just', 'like', 'know', 'yeah', 'but', 'are', 'your', 'all', 'get', 'about', 'would', 'there', 'right', 'think', 'really', 'here', 'can', 'now', 'well', 'got', 'they'],
+    es: ['que', 'de', 'no', 'la', 'el', 'es', 'y', 'en', 'lo', 'un', 'por', 'una', 'te', 'los', 'se', 'con', 'para', 'mi', 'bien', 'pero', 'si', 'del', 'al', 'me', 'como'],
+    pob: ['que', 'nao', 'uma', 'por', 'voce', 'voces', 'pra', 'ele', 'ela', 'isso', 'esta', 'ser', 'mais', 'bem'],
+    por: ['que', 'nao', 'uma', 'por', 'ele', 'ela', 'isso', 'esta', 'ser', 'mais', 'bem', 'voces', 'tambem'],
+    fr: ['que', 'qui', 'oui', 'non', 'je', 'vous', 'pour', 'avec', 'est', 'pas', 'une', 'des', 'les', 'dans', 'comme', 'mais', 'nous', 'elle', 'il', 'tu', 'sur'],
+    de: ['und', 'ich', 'nicht', 'die', 'das', 'der', 'du', 'was', 'mit', 'mir', 'sie', 'ist', 'ein', 'eine', 'dass', 'ja', 'auf', 'für', 'aber', 'wie'],
+    it: ['che', 'non', 'per', 'con', 'una', 'questo', 'questa', 'sono', 'sei', 'era', 'hai', 'ciao', 'perche', 'ma', 'come', 'gli', 'nel', 'degli']
+  };
+
+  let best = null;
+  let bestScore = 0;
+  let runnerUp = 0;
+  for (const [lang, list] of Object.entries(STOPWORDS)) {
+    let hits = 0;
+    for (const word of list) {
+      hits += counts[word] || 0;
+    }
+    const score = hits / Math.max(12, totalWords);
+    if (score > bestScore) {
+      runnerUp = bestScore;
+      bestScore = score;
+      best = lang;
+    } else if (score > runnerUp) {
+      runnerUp = score;
+    }
+  }
+
+  const asciiLetters = (sample.match(/[A-Za-z]/g) || []).length;
+  const nonAsciiLetters = (sample.match(/[^\x00-\x7F]/g) || []).length;
+  const asciiRatio = asciiLetters / Math.max(1, asciiLetters + nonAsciiLetters);
+
+  if (best && (bestScore >= 0.04 || (bestScore >= 0.025 && bestScore >= runnerUp * 1.35))) {
+    return normalizeTrackLanguageCode(best) || best;
+  }
+  if (!best && asciiRatio > 0.9 && latinLetters > 20) return 'en';
+  return null;
+}
+
+function applyContentLanguageGuesses(tracks) {
+  if (!Array.isArray(tracks)) return tracks || [];
+  return tracks.map((track) => {
+    if (!track || (track.language && track.language !== 'und')) return track;
+    const content = typeof track.content === 'string' ? track.content : null;
+    const guess = detectLanguageFromContent(content);
+    if (guess) {
+      return { ...track, language: guess, languageRaw: track.languageRaw || guess };
+    }
+    return track;
+  });
+}
+
+function collectSubtitleLanguagesFromMkv(buffer) {
+  if (!buffer || typeof buffer.byteLength !== 'number' || buffer.byteLength === 0) return [];
   try {
-    if (!buffer || typeof buffer.byteLength !== 'number' || buffer.byteLength === 0) return [];
-    const maxScanBytes = Math.min(buffer.byteLength, 12 * 1024 * 1024);
-    const headerInfo = parseMkvHeaderInfo(buffer, { maxScanBytes });
-    const subtitleTracks = (headerInfo?.tracks || []).filter((t) => {
-      const codec = (t.codecId || '').toLowerCase();
-      return t.type === 0x11 || t.type === 17 || codec.includes('s_text') || codec.includes('subtitle') || codec.includes('subrip') || codec.includes('ass') || codec.includes('pgs');
-    });
-    return subtitleTracks.map((t, idx) => ({
-      index: idx,
-      trackNumber: typeof t.number === 'number' ? t.number : null,
-      lang: normalizeTrackLanguageCode(t.language),
-      languageRaw: t.language || '',
-      name: t.name || ''
-    })).filter(entry => !!entry.lang);
-  } catch (err) {
+    const parseTracks = (maxScanBytes) => {
+      const headerInfo = parseMkvHeaderInfo(buffer, { maxScanBytes });
+      const subtitleTracks = (headerInfo?.tracks || []).filter((t) => {
+        const codec = (t.codecId || '').toLowerCase();
+        return t.type === 0x11 || t.type === 17 || codec.includes('s_text') || codec.includes('subtitle') || codec.includes('subrip') || codec.includes('ass') || codec.includes('pgs');
+      });
+      return subtitleTracks.map((t, idx) => {
+        const name = t.name || '';
+        const normalizedLang = normalizeTrackLanguageCode(t.languageIetf || t.language) || detectLanguageFromLabel(name) || null;
+        return {
+          index: idx,
+          trackNumber: typeof t.number === 'number' ? t.number : null,
+          lang: normalizedLang,
+          languageRaw: t.languageIetf || t.language || '',
+          name
+        };
+      }).filter(entry => !!entry.lang);
+    };
+
+    const primaryLimit = Math.min(buffer.byteLength, 24 * 1024 * 1024);
+    let langs = parseTracks(primaryLimit);
+    if (!langs.length && buffer.byteLength > primaryLimit) {
+      const deepLimit = Math.min(buffer.byteLength, 96 * 1024 * 1024);
+      if (deepLimit > primaryLimit) {
+        langs = parseTracks(deepLimit);
+      }
+    }
+    return langs;
+  } catch (_) {
     return [];
   }
+}
+
+function collectSubtitleLanguagesFromMp4(buffer) {
+  if (!buffer || typeof buffer.byteLength !== 'number' || buffer.byteLength === 0) return [];
+  const u8 = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+  const len = u8.length;
+  const readU32 = (off) => (u8[off] << 24 | u8[off + 1] << 16 | u8[off + 2] << 8 | u8[off + 3]) >>> 0;
+  const readStr = (off, count) => String.fromCharCode(...u8.subarray(off, off + count));
+
+  const handlersForSubs = new Set(['sbtl', 'subt', 'text', 'tx3g', 'wvtt', 'stpp', 'clcp']);
+  const tracks = [];
+
+  const walkBoxes = (start, end, visitor) => {
+    let p = start;
+    while (p + 8 <= end) {
+      const size = readU32(p);
+      const type = readStr(p + 4, 4);
+      if (!size) break;
+      const boxEnd = size === 1
+        ? Math.min(end, p + 16 + Number(readU32(p + 8)) * 2 ** 32) // large size; coarse safeguard
+        : Math.min(end, p + size);
+      visitor(type, p + 8, boxEnd);
+      if (boxEnd <= p) break;
+      p = boxEnd;
+    }
+  };
+
+  const decodeMdhdLanguage = (mdhdStart, mdhdEnd) => {
+    if (mdhdStart + 12 >= mdhdEnd) return null;
+    const version = u8[mdhdStart];
+    const langOffset = version === 1 ? mdhdStart + 20 : mdhdStart + 12;
+    if (langOffset + 2 > mdhdEnd) return null;
+    const langBits = (u8[langOffset] << 8) | u8[langOffset + 1];
+    const c1 = ((langBits >> 10) & 0x1F) + 0x60;
+    const c2 = ((langBits >> 5) & 0x1F) + 0x60;
+    const c3 = (langBits & 0x1F) + 0x60;
+    const code = String.fromCharCode(c1, c2, c3).replace(/\0/g, '').trim();
+    if (!code || code === 'und') return null;
+    return normalizeTrackLanguageCode(code) || code;
+  };
+
+  const decodeTrackIdFromTkhd = (start, end) => {
+    const version = u8[start];
+    const idOffset = version === 1 ? start + 20 : start + 12;
+    if (idOffset + 4 > end) return null;
+    return readU32(idOffset);
+  };
+
+  const parseTrak = (trakStart, trakEnd, trakIndex) => {
+    let handler = null;
+    let lang = null;
+    let trackId = null;
+    walkBoxes(trakStart, trakEnd, (type, boxStart, boxEnd) => {
+      if (type === 'tkhd' && trackId === null) {
+        trackId = decodeTrackIdFromTkhd(boxStart, boxEnd);
+      } else if (type === 'mdia') {
+        walkBoxes(boxStart, boxEnd, (mdType, mdStart, mdEnd) => {
+          if (mdType === 'hdlr') {
+            if (mdStart + 8 <= mdEnd) {
+              handler = readStr(mdStart + 4, 4);
+            }
+          } else if (mdType === 'mdhd' && !lang) {
+            lang = decodeMdhdLanguage(mdStart, mdEnd);
+          }
+        });
+      }
+    });
+    if (!handler || !handlersForSubs.has(handler)) return;
+    if (!lang) return;
+    tracks.push({
+      index: trakIndex,
+      trackNumber: trackId !== null ? trackId : null,
+      lang,
+      languageRaw: lang,
+      name: ''
+    });
+  };
+
+  try {
+    walkBoxes(0, len, (type, start, end) => {
+      if (type === 'moov') {
+        let idx = 0;
+        walkBoxes(start, end, (innerType, innerStart, innerEnd) => {
+          if (innerType === 'trak') {
+            parseTrak(innerStart, innerEnd, idx++);
+          }
+        });
+      }
+    });
+  } catch (_) {
+    return [];
+  }
+  return tracks;
+}
+
+function collectSubtitleLanguagesFromHeader(buffer) {
+  const mkv = collectSubtitleLanguagesFromMkv(buffer);
+  if (mkv.length) return mkv;
+  const mp4 = collectSubtitleLanguagesFromMp4(buffer);
+  if (mp4.length) return mp4;
+  return [];
 }
 
 function applyHeaderLanguagesToTracks(tracks, headerLangs) {
   if (!Array.isArray(tracks) || !tracks.length || !Array.isArray(headerLangs) || !headerLangs.length) return tracks || [];
   const usable = headerLangs.filter((l) => l && l.lang);
   if (!usable.length) return tracks;
+
+  const isGeneratedLabel = (label) => {
+    if (!label) return true;
+    const lower = String(label).toLowerCase();
+    if (/^extracted[_\s-]?sub/.test(lower)) return true;
+    if (/^remux[_\s-]?sub/.test(lower)) return true;
+    if (/^track\s+\d+/.test(lower)) return true;
+    if (/^subtitle\s+\d+/.test(lower)) return true;
+    return false;
+  };
+
   return tracks.map((track, idx) => {
     if (track?.language && track.language !== 'und') return track;
     const numericId = Number(track?.id);
@@ -4908,25 +5287,24 @@ function applyHeaderLanguagesToTracks(tracks, headerLangs) {
       if (Number.isInteger(numericId)) {
         const byTrackNumber = usable.find((l) => l.trackNumber !== null && (l.trackNumber === numericId || l.trackNumber === numericId + 1));
         if (byTrackNumber) return byTrackNumber;
-        const byIndex = usable.find((l) => l.index === numericId);
+        const byIndex = usable.find((l) => l.index === numericId - 1 || l.index === numericId);
         if (byIndex) return byIndex;
       }
       return usable[idx] || null;
     })();
     if (langEntry?.lang) {
+      const nextLabel = !track?.label || isGeneratedLabel(track.label)
+        ? (langEntry.name || track?.label || `Track ${idx + 1}`)
+        : track.label;
       return {
         ...track,
         language: langEntry.lang,
-        label: track?.label || langEntry.name || track?.label || `Track ${idx + 1}`
+        label: nextLabel
       };
     }
-    const labelGuess = detectLanguageFromLabel(track?.label || track?.name || '');
-    if (labelGuess) {
-      return {
-        ...track,
-        language: labelGuess
-      };
-    }
+    const labelSource = [track?.label, track?.name, track?.originalLabel].find((l) => l && !isGeneratedLabel(l));
+    const labelGuess = labelSource ? detectLanguageFromLabel(labelSource) : null;
+    if (labelGuess) return { ...track, language: labelGuess };
     return track;
   });
 }
@@ -5009,47 +5387,72 @@ async function demuxSubtitlesOffscreen(buffer, messageId, tabId) {
     });
 
     let response;
+    let lastError = null;
     const mustChunk = sendBytes > MAX_DIRECT_OFFSCREEN_BYTES;
     try {
-      try {
-        if (mustChunk) {
-          const Transfer = await ensureTransferHelper();
-          console.log('[Background] Buffer exceeds direct offscreen limit; using IDB transfer', { bytes: sendBytes });
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          if (mustChunk) {
+            const Transfer = await ensureTransferHelper();
+            console.log('[Background] Buffer exceeds direct offscreen limit; using IDB transfer', { bytes: sendBytes });
 
-          // Use IndexedDB transfer instead of chunked messaging
-          const transferId = `idb_${messageId}_${Date.now()}`;
-          await Transfer.saveTransferBuffer(transferId, uintPayload);
+            // Use IndexedDB transfer instead of chunked messaging
+            const transferId = `idb_${messageId}_${Date.now()}${attempt ? `_retry${attempt}` : ''}`;
+            await Transfer.saveTransferBuffer(transferId, uintPayload);
 
-          response = await sendDemuxRequest({
-            type: 'OFFSCREEN_FFMPEG_EXTRACT',
+            response = await sendDemuxRequest({
+              type: 'OFFSCREEN_FFMPEG_EXTRACT',
+              messageId,
+              transferId,
+              transferMethod: 'idb'
+            });
+          } else {
+            response = await sendDemuxRequest({
+              type: 'OFFSCREEN_FFMPEG_EXTRACT',
+              messageId,
+              buffer: uintPayload
+            });
+          }
+          break; // success, stop retry loop
+        } catch (err) {
+          lastError = err;
+
+          // If a direct send unexpectedly trips the runtime size cap, retry with IDB
+          if (!mustChunk && isMessageLengthError(err)) {
+            console.warn('[Background] Direct offscreen message too large; retrying with IDB transfer', { bytes: sendBytes });
+
+            const Transfer = await ensureTransferHelper();
+            const transferId = `idb_${messageId}_${Date.now()}_retry`;
+            await Transfer.saveTransferBuffer(transferId, uintPayload);
+
+            response = await sendDemuxRequest({
+              type: 'OFFSCREEN_FFMPEG_EXTRACT',
+              messageId,
+              transferId,
+              transferMethod: 'idb'
+            });
+            break;
+          }
+
+          // If the offscreen page vanished, recreate it and retry once.
+        if (isMissingOffscreenReceiver(err) && attempt === 0) {
+          console.warn('[Background][Offscreen] Demux receiver missing; recreating offscreen document and retrying', {
             messageId,
-            transferId,
-            transferMethod: 'idb'
+            error: err?.message
           });
-        } else {
-          response = await sendDemuxRequest({
-            type: 'OFFSCREEN_FFMPEG_EXTRACT',
-            messageId,
-            buffer: uintPayload
-          });
+          _offscreenCreated = false;
+          _offscreenReady = false;
+          try { await forceCloseOffscreenDocument('missing-offscreen-retry'); } catch (_) { }
+          await ensureOffscreenDocument(true);
+          continue;
         }
-      } catch (err) {
-        // If a direct send unexpectedly trips the runtime size cap, retry with IDB
-        if (mustChunk || !isMessageLengthError(err)) {
+
+          // Non-retryable error
           throw err;
         }
-        console.warn('[Background] Direct offscreen message too large; retrying with IDB transfer', { bytes: sendBytes });
-
-        const Transfer = await ensureTransferHelper();
-        const transferId = `idb_${messageId}_${Date.now()}_retry`;
-        await Transfer.saveTransferBuffer(transferId, uintPayload);
-
-        response = await sendDemuxRequest({
-          type: 'OFFSCREEN_FFMPEG_EXTRACT',
-          messageId,
-          transferId,
-          transferMethod: 'idb'
-        });
+      }
+      if (!response && lastError) {
+        throw lastError;
       }
 
       // If the response is slim (no tracks or chunked), wait for the pushed result that carries the full payload.
@@ -5068,42 +5471,43 @@ async function demuxSubtitlesOffscreen(buffer, messageId, tabId) {
           });
         }
       }
+
+      if (!response) {
+        console.warn('[Background][Offscreen] Demux response missing', { messageId, durationMs: Date.now() - startedAt });
+        throw new Error('Offscreen demux returned no response');
+      }
+      if (response?.success) {
+        sendDebugLog(tabId, messageId, 'Offscreen FFmpeg demux: completed', 'info');
+        let tracks = response.tracks || [];
+        const headerLangs = collectSubtitleLanguagesFromHeader(uintPayload);
+        if (headerLangs.length) {
+          const beforeCount = (tracks || []).filter(t => t && t.language && t.language !== 'und').length;
+          tracks = applyHeaderLanguagesToTracks(tracks, headerLangs);
+          const afterCount = (tracks || []).filter(t => t && t.language && t.language !== 'und').length;
+          if (afterCount > beforeCount) {
+            sendDebugLog(tabId, messageId, `Detected language tags for ${afterCount} track(s) from MKV header`, 'info');
+          }
+        }
+        tracks = applyContentLanguageGuesses(tracks);
+        const filtered = filterTextTracksOnly(tracks);
+        if (filtered.length !== tracks.length) {
+          sendDebugLog(tabId, messageId, `Omitted ${tracks.length - filtered.length} binary/copy track(s) from response`, 'info');
+        }
+        console.log('[Background][Offscreen] Demux response success', {
+          messageId,
+          trackCount: filtered?.length,
+          durationMs: Date.now() - startedAt
+        });
+        return filtered;
+      }
+      const errMsg = response?.error || 'Offscreen demux failed';
+      sendDebugLog(tabId, messageId, `Offscreen FFmpeg demux failed: ${errMsg}`, 'error');
+      console.warn('[Background][Offscreen] Demux response error', { messageId, error: errMsg, durationMs: Date.now() - startedAt });
+      throw new Error(errMsg);
     } finally {
       cancelDirect?.();
       cancelPushWait();
     }
-
-    if (!response) {
-      console.warn('[Background][Offscreen] Demux response missing', { messageId, durationMs: Date.now() - startedAt });
-      throw new Error('Offscreen demux returned no response');
-    }
-    if (response?.success) {
-      sendDebugLog(tabId, messageId, 'Offscreen FFmpeg demux: completed', 'info');
-      let tracks = response.tracks || [];
-      const headerLangs = collectSubtitleLanguagesFromHeader(uintPayload);
-      if (headerLangs.length) {
-        const beforeCount = (tracks || []).filter(t => t && t.language && t.language !== 'und').length;
-        tracks = applyHeaderLanguagesToTracks(tracks, headerLangs);
-        const afterCount = (tracks || []).filter(t => t && t.language && t.language !== 'und').length;
-        if (afterCount > beforeCount) {
-          sendDebugLog(tabId, messageId, `Detected language tags for ${afterCount} track(s) from MKV header`, 'info');
-        }
-      }
-      const filtered = filterTextTracksOnly(tracks);
-      if (filtered.length !== tracks.length) {
-        sendDebugLog(tabId, messageId, `Omitted ${tracks.length - filtered.length} binary/copy track(s) from response`, 'info');
-      }
-      console.log('[Background][Offscreen] Demux response success', {
-        messageId,
-        trackCount: filtered?.length,
-        durationMs: Date.now() - startedAt
-      });
-      return filtered;
-    }
-    const errMsg = response?.error || 'Offscreen demux failed';
-    sendDebugLog(tabId, messageId, `Offscreen FFmpeg demux failed: ${errMsg}`, 'error');
-    console.warn('[Background][Offscreen] Demux response error', { messageId, error: errMsg, durationMs: Date.now() - startedAt });
-    throw new Error(errMsg);
   } finally {
     endOffscreen();
   }
@@ -5142,6 +5546,7 @@ async function resolveHlsPlaylist(m3u8Url, baseHeaders = null, depth = 0) {
     const lines = text.split(/\r?\n/);
     const variants = [];
     const audioGroups = new Map();
+    const subtitleTracks = [];
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       if (line.startsWith('#EXT-X-STREAM-INF')) {
@@ -5157,9 +5562,19 @@ async function resolveHlsPlaylist(m3u8Url, baseHeaders = null, depth = 0) {
         }
       } else if (line.startsWith('#EXT-X-MEDIA')) {
         const attrs = parseAttrs(line);
-        if ((attrs.TYPE || '').toUpperCase() === 'AUDIO' && attrs.URI) {
+        const type = (attrs.TYPE || '').toUpperCase();
+        if (type === 'AUDIO' && attrs.URI) {
           audioGroups.set(attrs['GROUP-ID'] || '', {
             uri: attrs.URI,
+            isDefault: String(attrs.DEFAULT || '').toUpperCase() === 'YES',
+            autoselect: String(attrs.AUTOSELECT || '').toUpperCase() === 'YES'
+          });
+        } else if (type === 'SUBTITLES') {
+          subtitleTracks.push({
+            groupId: attrs['GROUP-ID'] || '',
+            lang: normalizeTrackLanguageCode(attrs.LANGUAGE || ''),
+            name: attrs.NAME || '',
+            uri: attrs.URI ? new URL(attrs.URI, m3u8Url).toString() : null,
             isDefault: String(attrs.DEFAULT || '').toUpperCase() === 'YES',
             autoselect: String(attrs.AUTOSELECT || '').toUpperCase() === 'YES'
           });
@@ -5199,12 +5614,12 @@ async function resolveHlsPlaylist(m3u8Url, baseHeaders = null, depth = 0) {
 
     if (audioChoice?.uri) {
       const audioUrl = new URL(audioChoice.uri, m3u8Url).toString();
-      return resolveHlsPlaylist(audioUrl, baseHeaders, depth + 1);
+      return { ...(await resolveHlsPlaylist(audioUrl, baseHeaders, depth + 1)), subtitleLangs: subtitleTracks };
     }
 
     if (!preferredVariant?.uri) throw new Error('No variant stream found');
     const variantUrl = new URL(preferredVariant.uri, m3u8Url).toString();
-    return resolveHlsPlaylist(variantUrl, baseHeaders, depth + 1);
+    return { ...(await resolveHlsPlaylist(variantUrl, baseHeaders, depth + 1)), subtitleLangs: subtitleTracks };
   }
 
   // Media playlist
@@ -5227,7 +5642,7 @@ async function resolveHlsPlaylist(m3u8Url, baseHeaders = null, depth = 0) {
     }
   }
   if (segments.length === 0) throw new Error('No HLS segments');
-  return { playlistUrl: m3u8Url, segments, totalDurationSec: totalDur, map };
+  return { playlistUrl: m3u8Url, segments, totalDurationSec: totalDur, map, subtitleLangs: [] };
 }
 
 function sliceSegmentsForWindow(segments, startSec, durSec) {
@@ -5246,7 +5661,7 @@ function sliceSegmentsForWindow(segments, startSec, durSec) {
 }
 
 async function fetchHlsWindows(m3u8Url, onProgress, planInput = null, baseHeaders = null) {
-  const { segments, totalDurationSec, map } = await resolveHlsPlaylist(m3u8Url, baseHeaders);
+  const { segments, totalDurationSec, map, subtitleLangs = [] } = await resolveHlsPlaylist(m3u8Url, baseHeaders);
   const { windows } = planWindows(totalDurationSec, normalizeSyncPlan(planInput));
   const totalSegmentsToFetch = windows
     .map(w => sliceSegmentsForWindow(segments, w.startSec, w.durSec).length)
@@ -5303,11 +5718,11 @@ async function fetchHlsWindows(m3u8Url, onProgress, planInput = null, baseHeader
   }
 
   onProgress(100);
-  return { windows: result, totalDurationSec };
+  return { windows: result, totalDurationSec, subtitleLangs };
 }
 
 async function fetchHlsSample(m3u8Url, onProgress, options = {}, baseHeaders = null) {
-  const { segments, totalDurationSec, map } = await resolveHlsPlaylist(m3u8Url, baseHeaders);
+  const { segments, totalDurationSec, map, subtitleLangs = [] } = await resolveHlsPlaylist(m3u8Url, baseHeaders);
   const baseTarget = 900; // seconds to grab in single mode
   const targetDuration = Math.max(baseTarget, Math.round(options?.minDurationSec || 0));
   const buffers = [];
@@ -5348,7 +5763,7 @@ async function fetchHlsSample(m3u8Url, onProgress, options = {}, baseHeaders = n
   }
   for (const buf of buffers) { out.set(buf, offset); offset += buf.byteLength; }
   onProgress?.(100);
-  return { buffer: out.buffer, durationSec: totalDurationSec };
+  return { buffer: out.buffer, durationSec: totalDurationSec, subtitleLangs };
 }
 
 // ---------- Helpers: FFmpeg loader ----------
@@ -5581,7 +5996,7 @@ async function getFfsubsync(ctx = null) {
         return null;
       }
       try {
-        importScripts(loaderUrl);
+        await importScriptSafe(loaderUrl, 'ffsubsync-wasm.js');
       } catch (loadErr) {
         console.warn('[Background] Failed to load ffsubsync-wasm wrapper:', loadErr?.message);
         logToPage(`ffsubsync wrapper load failed: ${loadErr?.message || loadErr}`, 'error');
@@ -5624,7 +6039,7 @@ async function getAlass(ctx = null) {
         return null;
       }
       try {
-        importScripts(alassUrl);
+        await importScriptSafe(alassUrl, 'alass-wasm.js');
       } catch (loadErr) {
         console.warn('[Background] Failed to load alass-wasm wrapper:', loadErr?.message);
         logToPage(`alass wrapper load failed: ${loadErr?.message || loadErr}`, 'error');

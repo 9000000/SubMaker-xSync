@@ -57,7 +57,6 @@
     {
       "resources": [
         "background.full.js",
-        "scripts/background/background.full.js",
         "assets/lib/ffmpeg.js",
         "assets/lib/ffmpeg.min.js",
         "assets/lib/ffmpeg-core.js",
@@ -75,6 +74,14 @@
         "assets/lib/whisper-main.js",
         "assets/lib/ggml-tiny.en-q5_1.bin",
         "assets/lib/vosk-browser.js",
+        "assets/lib/paddle/paddlejs-core.js",
+        "assets/lib/paddle/paddlejs-backend-webgl.js",
+        "assets/lib/paddle/paddlejs-opencv.js",
+        "assets/lib/paddle/paddlejs-ocr.js",
+        "assets/lib/tesseract/tesseract.min.js",
+        "assets/lib/tesseract/worker.min.js",
+        "assets/lib/tesseract/tesseract-core.wasm",
+        "assets/lib/tesseract/eng.traineddata",
         "assets/models/vosk-model-small-en-us-0.15.tar.gz"
       ],
       "matches": ["<all_urls>"]

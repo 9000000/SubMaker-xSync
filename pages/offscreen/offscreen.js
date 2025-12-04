@@ -246,11 +246,731 @@ function uint8ToBase64(u8) {
   return btoa(str);
 }
 
+function decodeUtf8Safe(u8) {
+  try {
+    return new TextDecoder('utf-8', { fatal: false }).decode(u8);
+  } catch (_) {
+    try {
+      return new TextDecoder().decode(u8);
+    } catch (_) {
+      return '';
+    }
+  }
+}
+
+function readVint(u8, offset) {
+  const first = u8[offset];
+  if (first === undefined) return null;
+  let length = 1;
+  let mask = 0x80;
+  while (length <= 8 && (first & mask) === 0) {
+    length += 1;
+    mask >>= 1;
+  }
+  if (length > 8) return null;
+  let value = first & (mask - 1);
+  for (let i = 1; i < length; i++) {
+    value = (value << 8) | u8[offset + i];
+  }
+  return { length, value };
+}
+
+function readEbmlElement(u8, offset, limit) {
+  if (offset >= limit) return null;
+  const idInfo = readVint(u8, offset);
+  if (!idInfo) return null;
+  // For element IDs, preserve the full raw bytes (VINT marker bits included).
+  let idRaw = 0;
+  for (let i = 0; i < idInfo.length; i++) {
+    idRaw = (idRaw << 8) | u8[offset + i];
+  }
+  const sizeInfo = readVint(u8, offset + idInfo.length);
+  if (!sizeInfo) return null;
+  const dataStart = offset + idInfo.length + sizeInfo.length;
+  let size = sizeInfo.value;
+  // Unknown-size EBML elements set all size bits; treat as consuming the remaining scan window
+  if (size === (Math.pow(2, 7 * sizeInfo.length) - 1)) {
+    size = Math.max(0, limit - dataStart);
+  }
+  let dataEnd = dataStart + size;
+  if (dataEnd > limit) {
+    // Element spills past the scanned window (common when probing with a byte range).
+    // Cap to the available buffer so we can still walk nested headers like Tracks.
+    dataEnd = limit;
+    size = Math.max(0, dataEnd - dataStart);
+  }
+  if (dataStart >= limit) return null;
+  return {
+    id: idRaw >>> 0,
+    idHex: (idRaw >>> 0).toString(16).toUpperCase(),
+    size,
+    header: idInfo.length + sizeInfo.length,
+    dataStart,
+    dataEnd
+  };
+}
+
+function parseMkvHeaderInfo(buffer, opts = {}) {
+  const u8 = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer || 0);
+  const limit = Math.min(u8.length, opts.maxScanBytes || u8.length);
+  const info = {
+    segmentOffset: null,
+    seekHead: [],
+    tracks: [],
+    cues: [],
+    attachments: [],
+    chapters: []
+  };
+
+  const ID = {
+    SEGMENT: '18538067',
+    SEEK_HEAD: '114D9B74',
+    SEEK: '4DBB',
+    SEEK_ID: '53AB',
+    SEEK_POSITION: '53AC',
+    CUES: '1C53BB6B',
+    CUE_POINT: 'BB',
+    CUE_TIME: 'B3',
+    CUE_TRACK_POSITIONS: 'B7',
+    CUE_TRACK: 'F7',
+    CUE_CLUSTER_POS: 'F1',
+    CUE_REL_POS: 'F0',
+    TRACKS: '1654AE6B',
+    TRACK_ENTRY: 'AE',
+    TRACK_NUMBER: 'D7',
+    TRACK_TYPE: '83',
+    TRACK_NAME: '536E',
+    TRACK_LANGUAGE: '22B59C',       // RFC 1766 / ISO-639-2
+    TRACK_LANGUAGE_IETF: '22B59D',  // RFC 5646 (modern)
+    CODEC_ID: '86',
+    ATTACHMENTS: '1941A469',
+    ATTACHED_FILE: '61A7',
+    FILE_NAME: '466E',
+    FILE_MIME: '4660',
+    FILE_DATA: '465C',
+    CHAPTERS: '1043A770',
+    EDITION_ENTRY: '45B9',
+    CHAPTER_ATOM: 'B6',
+    CHAPTER_TIME_START: '91',
+    CHAPTER_TIME_END: '92'
+  };
+
+  function parseUint(u8Arr, start, end) {
+    let v = 0;
+    for (let i = start; i < end; i++) v = (v << 8) | u8Arr[i];
+    return v >>> 0;
+  }
+
+  function parseString(u8Arr, start, end) {
+    return decodeUtf8Safe(u8Arr.subarray(start, end)).trim();
+  }
+
+  function walk(start, end, handlers) {
+    let p = start;
+    while (p < end) {
+      const el = readEbmlElement(u8, p, end);
+      if (!el) break;
+      const handler = handlers?.[el.idHex];
+      if (handler) {
+        handler(el);
+      }
+      p = el.dataEnd;
+    }
+  }
+
+  let segmentStart = null;
+  walk(0, limit, {
+    [ID.SEGMENT]: (el) => {
+      segmentStart = el.dataStart;
+      info.segmentOffset = el.dataStart;
+      const segEnd = Math.min(el.dataEnd, limit);
+      walk(el.dataStart, segEnd, {
+        [ID.SEEK_HEAD]: parseSeekHead,
+        [ID.TRACKS]: parseTracks,
+        [ID.CUES]: parseCues,
+        [ID.ATTACHMENTS]: parseAttachments,
+        [ID.CHAPTERS]: parseChapters
+      });
+    }
+  });
+
+  function parseSeekHead(el) {
+    walk(el.dataStart, Math.min(el.dataEnd, limit), {
+      [ID.SEEK]: (seekEl) => {
+        let seekId = null;
+        let seekPos = null;
+        walk(seekEl.dataStart, Math.min(seekEl.dataEnd, limit), {
+          [ID.SEEK_ID]: (idEl) => { seekId = parseUint(u8, idEl.dataStart, idEl.dataEnd); },
+          [ID.SEEK_POSITION]: (posEl) => { seekPos = parseUint(u8, posEl.dataStart, posEl.dataEnd); }
+        });
+        if (seekId !== null && seekPos !== null) {
+          info.seekHead.push({ id: seekId, idHex: seekId.toString(16).toUpperCase(), position: seekPos });
+        }
+      }
+    });
+  }
+
+  function parseTracks(el) {
+    walk(el.dataStart, Math.min(el.dataEnd, limit), {
+      [ID.TRACK_ENTRY]: (tEl) => {
+        const track = { number: null, type: null, name: '', language: '', languageIetf: '', codecId: '' };
+        walk(tEl.dataStart, Math.min(tEl.dataEnd, limit), {
+          [ID.TRACK_NUMBER]: (nEl) => { track.number = parseUint(u8, nEl.dataStart, nEl.dataEnd); },
+          [ID.TRACK_TYPE]: (tEl2) => { track.type = parseUint(u8, tEl2.dataStart, tEl2.dataEnd); },
+          [ID.TRACK_NAME]: (nEl) => { track.name = parseString(u8, nEl.dataStart, nEl.dataEnd); },
+          [ID.TRACK_LANGUAGE]: (lEl) => { track.language = parseString(u8, lEl.dataStart, lEl.dataEnd); },
+          [ID.TRACK_LANGUAGE_IETF]: (lEl) => { track.languageIetf = parseString(u8, lEl.dataStart, lEl.dataEnd); },
+          [ID.CODEC_ID]: (cEl) => { track.codecId = parseString(u8, cEl.dataStart, cEl.dataEnd); }
+        });
+        if (track.languageIetf && !track.language) {
+          track.language = track.languageIetf;
+        }
+        info.tracks.push(track);
+      }
+    });
+  }
+
+  function parseCues(el) {
+    walk(el.dataStart, Math.min(el.dataEnd, limit), {
+      [ID.CUE_POINT]: (cpEl) => {
+        let cueTime = null;
+        const positions = [];
+        walk(cpEl.dataStart, Math.min(cpEl.dataEnd, limit), {
+          [ID.CUE_TIME]: (tEl) => { cueTime = parseUint(u8, tEl.dataStart, tEl.dataEnd); },
+          [ID.CUE_TRACK_POSITIONS]: (posEl) => {
+            let track = null, clusterPos = null, relPos = null;
+            walk(posEl.dataStart, Math.min(posEl.dataEnd, limit), {
+              [ID.CUE_TRACK]: (elT) => { track = parseUint(u8, elT.dataStart, elT.dataEnd); },
+              [ID.CUE_CLUSTER_POS]: (elP) => { clusterPos = parseUint(u8, elP.dataStart, elP.dataEnd); },
+              [ID.CUE_REL_POS]: (elRP) => { relPos = parseUint(u8, elRP.dataStart, elRP.dataEnd); }
+            });
+            positions.push({ track, clusterPos, relPos });
+          }
+        });
+        if (cueTime !== null) {
+          info.cues.push({ time: cueTime, positions });
+        }
+      }
+    });
+  }
+
+  function parseAttachments(el) {
+    walk(el.dataStart, Math.min(el.dataEnd, limit), {
+      [ID.ATTACHED_FILE]: (aEl) => {
+        let name = '';
+        let mime = '';
+        let data = null;
+        walk(aEl.dataStart, Math.min(aEl.dataEnd, limit), {
+          [ID.FILE_NAME]: (f) => { name = parseString(u8, f.dataStart, f.dataEnd); },
+          [ID.FILE_MIME]: (f) => { mime = parseString(u8, f.dataStart, f.dataEnd); },
+          [ID.FILE_DATA]: (f) => { data = u8.subarray(f.dataStart, Math.min(f.dataEnd, limit)); }
+        });
+        if (data && data.length) {
+          info.attachments.push({ name, mime, data });
+        }
+      }
+    });
+  }
+
+  function parseChapters(el) {
+    walk(el.dataStart, Math.min(el.dataEnd, limit), {
+      [ID.EDITION_ENTRY]: (edEl) => {
+        walk(edEl.dataStart, Math.min(edEl.dataEnd, limit), {
+          [ID.CHAPTER_ATOM]: (chEl) => {
+            let start = null;
+            let end = null;
+            walk(chEl.dataStart, Math.min(chEl.dataEnd, limit), {
+              [ID.CHAPTER_TIME_START]: (sEl) => { start = parseUint(u8, sEl.dataStart, sEl.dataEnd); },
+              [ID.CHAPTER_TIME_END]: (eEl) => { end = parseUint(u8, eEl.dataStart, eEl.dataEnd); }
+            });
+            if (start !== null) {
+              info.chapters.push({ start, end });
+            }
+          }
+        });
+      }
+    });
+  }
+
+  return { ...info, segmentOffset: segmentStart ?? info.segmentOffset };
+}
+
 // Naming helpers to keep extracted tracks consistent across modes
 const EXTRACTED_PREFIX = 'extracted_sub';
 const EXTRACTED_SRT_PATTERN = /^extracted_sub_\d+\.srt$/i;
 const EXTRACTED_COPY_PATTERN = /^extracted_sub_\d+\.mkv$/i;
 const EXTRACTED_FIX_PATTERN = /^extracted_sub_fix_\d+\.srt$/i;
+
+const TRACK_LANG_NORMALIZE_MAP = {
+  eng: 'en', enu: 'en', enus: 'en', enn: 'en', enuk: 'en', en_gb: 'en', en_gb: 'en', enus: 'en', engb: 'en', enau: 'en', enze: 'en',
+  spa: 'es', esl: 'es', esu: 'es', esp: 'es', espanol: 'es', spn: 'es', es419: 'es', lat: 'es', latam: 'es', castellano: 'es',
+  por: 'por', pt: 'por', porpt: 'por', pt_pt: 'por',
+  pob: 'pob', pb: 'pob', ptb: 'pob', ptbr: 'pob', 'pt-br': 'pob', porbr: 'pob', brazpor: 'pob', brazilian: 'pob',
+  fre: 'fr', fra: 'fr', frf: 'fr', frca: 'fr', frfr: 'fr',
+  ger: 'de', deu: 'de', gerde: 'de',
+  ita: 'it', itb: 'it',
+  rus: 'ru', rusru: 'ru',
+  chi: 'zh', zho: 'zh', cmn: 'zh', mlt: 'zh', mnd: 'zh', chs: 'zh', cht: 'zh', zhn: 'zh', zhcn: 'zh', zhtw: 'zh', zh_hans: 'zh', zh_hant: 'zh',
+  jpn: 'ja', jap: 'ja', jp: 'ja',
+  kor: 'ko', korus: 'ko', kr: 'ko',
+  ara: 'ar', arg: 'ar', arb: 'ar', arq: 'ar',
+  hin: 'hi', hnd: 'hi',
+  tur: 'tr', turk: 'tr',
+  pol: 'pl',
+  dut: 'nl', nld: 'nl', hol: 'nl', fla: 'nl', vla: 'nl',
+  swe: 'sv', sve: 'sv',
+  nor: 'no', nob: 'no', nno: 'no', norw: 'no', bok: 'no', nyn: 'no',
+  dan: 'da',
+  fin: 'fi',
+  hun: 'hu', hunh: 'hu',
+  ces: 'cs', cze: 'cs',
+  ell: 'el', gre: 'el', grk: 'el',
+  heb: 'he', arahe: 'he', hebrew: 'he', iw: 'he',
+  vie: 'vi', vit: 'vi',
+  ind: 'id', ina: 'id', bah: 'id',
+  tha: 'th',
+  ukr: 'uk', ukraines: 'uk',
+  ron: 'ro', rum: 'ro', rom: 'ro', rop: 'ro',
+  bul: 'bg',
+  slk: 'sk', slo: 'sk',
+  slv: 'sl',
+  hrv: 'hr', cro: 'hr',
+  srp: 'sr', scc: 'sr',
+  bos: 'bs',
+  cat: 'ca',
+  fas: 'fa', per: 'fa', pes: 'fa', farsi: 'fa',
+  urd: 'ur',
+  ben: 'bn', bang: 'bn',
+  tam: 'ta',
+  tel: 'te',
+  mar: 'mr',
+  kan: 'kn',
+  mal: 'ml',
+  pan: 'pa', pun: 'pa',
+  guj: 'gu',
+  nep: 'ne',
+  sin: 'si',
+  mya: 'my', bur: 'my',
+  khm: 'km',
+  lao: 'lo', laoian: 'lo',
+  mon: 'mn',
+  uzb: 'uz',
+  kaz: 'kk',
+  kir: 'ky',
+  tgk: 'tg',
+  tuk: 'tk',
+  pus: 'ps', pst: 'ps',
+  som: 'so',
+  amh: 'am',
+  hau: 'ha',
+  yor: 'yo',
+  zul: 'zu',
+  xho: 'xh',
+  afr: 'af',
+  eus: 'eu', baq: 'eu',
+  glg: 'gl',
+  glv: 'gv',
+  gle: 'ga',
+  cym: 'cy', wel: 'cy',
+  isl: 'is',
+  sqi: 'sq', alb: 'sq',
+  mkd: 'mk', mac: 'mk',
+  est: 'et',
+  lit: 'lt',
+  lav: 'lv',
+  aze: 'az',
+  kat: 'ka', geo: 'ka',
+  amh: 'am',
+  epo: 'eo',
+  fil: 'tl', tgl: 'tl',
+  msa: 'ms', may: 'ms'
+};
+
+const LANGUAGE_NAME_ALIASES = {
+  english: 'en', anglisch: 'en', anglais: 'en', ingles: 'en',
+  spanish: 'es', espanol: 'es', castellano: 'es', latino: 'es', latam: 'es',
+  portuguese: 'por', portugues: 'por', portugal: 'por',
+  brazilian: 'pob', brazillian: 'pob', brazillianportuguese: 'pob', brazilianportuguese: 'pob', portuguese_brazil: 'pob', portuguese_brazilian: 'pob',
+  french: 'fr', francais: 'fr', francophone: 'fr',
+  german: 'de', deutsch: 'de',
+  italian: 'it', italiano: 'it',
+  russian: 'ru', russisch: 'ru', russkiy: 'ru',
+  chinese: 'zh', mandarin: 'zh', cantonese: 'zh', taiwanese: 'zh',
+  japanese: 'ja', nihongo: 'ja',
+  korean: 'ko', hangul: 'ko',
+  arabic: 'ar',
+  hindi: 'hi',
+  turkish: 'tr',
+  polish: 'pl',
+  dutch: 'nl', flemish: 'nl', nederlands: 'nl',
+  swedish: 'sv', svenska: 'sv',
+  norwegian: 'no', bokmal: 'no', nynorsk: 'no',
+  danish: 'da', dansk: 'da',
+  finnish: 'fi', suomi: 'fi',
+  hungarian: 'hu', magyar: 'hu',
+  czech: 'cs', cesky: 'cs',
+  greek: 'el', hellenic: 'el',
+  hebrew: 'he', yiddish: 'yi',
+  vietnamese: 'vi',
+  indonesian: 'id', bahasa: 'id',
+  thai: 'th',
+  ukrainian: 'uk',
+  romanian: 'ro',
+  bulgarian: 'bg',
+  slovak: 'sk',
+  slovenian: 'sl',
+  croatian: 'hr',
+  serbian: 'sr',
+  bosnian: 'bs',
+  catalan: 'ca',
+  persian: 'fa', farsi: 'fa', dari: 'fa',
+  urdu: 'ur',
+  bengali: 'bn',
+  tamil: 'ta',
+  telugu: 'te',
+  marathi: 'mr',
+  kannada: 'kn',
+  malayalam: 'ml',
+  punjabi: 'pa',
+  gujarati: 'gu',
+  nepali: 'ne',
+  sinhala: 'si',
+  burmese: 'my',
+  khmer: 'km',
+  lao: 'lo',
+  mongolian: 'mn',
+  uzbek: 'uz',
+  kazakh: 'kk',
+  kyrgyz: 'ky',
+  tajik: 'tg',
+  turkmen: 'tk',
+  pashto: 'ps',
+  somali: 'so',
+  amharic: 'am',
+  hausa: 'ha',
+  yoruba: 'yo',
+  zulu: 'zu',
+  xhosa: 'xh',
+  afrikaans: 'af',
+  basque: 'eu',
+  galician: 'gl',
+  irish: 'ga',
+  welsh: 'cy',
+  icelandic: 'is',
+  albanian: 'sq',
+  macedonian: 'mk',
+  estonian: 'et',
+  lithuanian: 'lt',
+  latvian: 'lv',
+  azerbaijani: 'az',
+  georgian: 'ka',
+  esperanto: 'eo',
+  tagalog: 'tl',
+  filipino: 'tl',
+  malay: 'ms'
+};
+
+function normalizeTrackLanguageCode(raw) {
+  if (!raw) return null;
+  const rawStr = String(raw).trim().toLowerCase();
+  if (/^extracte/.test(rawStr)) return null;
+  if (/^extracted[_\s-]?sub/.test(rawStr)) return null;
+  if (/^remux[_\s-]?sub/.test(rawStr)) return null;
+  if (/^track\s*\d+/.test(rawStr)) return null;
+  if (/^subtitle\s*\d+/.test(rawStr)) return null;
+  const cleaned = rawStr.replace(/[^a-z-]/g, '');
+  if (!cleaned) return null;
+  const base = cleaned.split('-')[0];
+  if (!base) return null;
+  if (TRACK_LANG_NORMALIZE_MAP[base]) return TRACK_LANG_NORMALIZE_MAP[base];
+  if (LANGUAGE_NAME_ALIASES[base]) return LANGUAGE_NAME_ALIASES[base];
+  if (base.length === 2) return base;
+  if (base.length === 3 && TRACK_LANG_NORMALIZE_MAP[base]) return TRACK_LANG_NORMALIZE_MAP[base];
+  if (base.length === 3) return base;
+  return base.slice(0, 8);
+}
+
+function detectLanguageFromLabel(label) {
+  if (!label) return null;
+  const lowered = String(label).toLowerCase();
+  if (/^extracte/.test(lowered)) return null;
+  if (/^extracted[_\s-]?sub/.test(lowered)) return null;
+  if (/^remux[_\s-]?sub/.test(lowered)) return null;
+  if (/^track\s+\d+/.test(lowered)) return null;
+  if (/^subtitle\s+\d+/.test(lowered)) return null;
+  if (lowered.includes('brazil')) return 'pob';
+  if (lowered.includes('portuguese (br')) return 'pob';
+  const codeMatch = lowered.match(/(?:^|\[|\(|\s)([a-z]{2,3})(?:\s|$|\]|\))/);
+  if (codeMatch) {
+    const byCode = normalizeTrackLanguageCode(codeMatch[1]);
+    if (byCode) return byCode;
+  }
+  const cleaned = lowered.replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return null;
+  if (LANGUAGE_NAME_ALIASES[cleaned]) return LANGUAGE_NAME_ALIASES[cleaned];
+  const parts = cleaned.split(' ');
+  for (const part of parts) {
+    const byName = LANGUAGE_NAME_ALIASES[part];
+    if (byName) return byName;
+    const byCode = normalizeTrackLanguageCode(part);
+    if (byCode) return byCode;
+  }
+  return null;
+}
+
+function detectLanguageFromContent(text) {
+  if (!text || typeof text !== 'string') return null;
+  const sample = text.slice(0, 48000);
+  const cyrillicLetters = (sample.match(/[\u0400-\u04FF]/g) || []).length;
+  const latinLetters = (sample.match(/[A-Za-z\u00C0-\u024F]/g) || []).length;
+  if (cyrillicLetters > 24 && cyrillicLetters >= latinLetters * 0.15) return 'ru';
+
+  const cleaned = sample
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&[a-z]+;/gi, ' ')
+    .replace(/\d{2}:\d{2}:\d{2}[,\.]\d{3}\s+-->\s+\d{2}:\d{2}:\d{2}[,\.]\d{3}/g, ' ')
+    .replace(/\d+\s*\n\d{2}:\d{2}:\d{2}[^\n]*-->[^\n]+/g, ' ')
+    .replace(/[^A-Za-z\u00C0-\u024F]+/g, ' ')
+    .toLowerCase();
+  const normalized = cleaned.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const words = normalized.split(/\s+/).filter((w) => w.length > 1);
+  if (!words.length) return null;
+  const totalWords = words.length;
+  const counts = {};
+  for (const w of words) counts[w] = (counts[w] || 0) + 1;
+
+  const STOPWORDS = {
+    en: ['the', 'and', 'you', 'that', 'this', 'for', 'with', 'not', 'have', 'just', 'like', 'know', 'yeah', 'but', 'are', 'your', 'all', 'get', 'about', 'would', 'there', 'right', 'think', 'really', 'here', 'can', 'now', 'well', 'got', 'they'],
+    es: ['que', 'de', 'no', 'la', 'el', 'es', 'y', 'en', 'lo', 'un', 'por', 'una', 'te', 'los', 'se', 'con', 'para', 'mi', 'bien', 'pero', 'si', 'del', 'al', 'me', 'como'],
+    pob: ['que', 'nao', 'uma', 'por', 'voce', 'voces', 'pra', 'ele', 'ela', 'isso', 'esta', 'ser', 'mais', 'bem'],
+    por: ['que', 'nao', 'uma', 'por', 'ele', 'ela', 'isso', 'esta', 'ser', 'mais', 'bem', 'voces', 'tambem'],
+    fr: ['que', 'qui', 'oui', 'non', 'je', 'vous', 'pour', 'avec', 'est', 'pas', 'une', 'des', 'les', 'dans', 'comme', 'mais', 'nous', 'elle', 'il', 'tu', 'sur'],
+    de: ['und', 'ich', 'nicht', 'die', 'das', 'der', 'du', 'was', 'mit', 'mir', 'sie', 'ist', 'ein', 'eine', 'dass', 'ja', 'auf', 'für', 'aber', 'wie'],
+    it: ['che', 'non', 'per', 'con', 'una', 'questo', 'questa', 'sono', 'sei', 'era', 'hai', 'ciao', 'perche', 'ma', 'come', 'gli', 'nel', 'degli']
+  };
+
+  let best = null;
+  let bestScore = 0;
+  let runnerUp = 0;
+  for (const [lang, list] of Object.entries(STOPWORDS)) {
+    let hits = 0;
+    for (const word of list) {
+      hits += counts[word] || 0;
+    }
+    const score = hits / Math.max(12, totalWords);
+    if (score > bestScore) {
+      runnerUp = bestScore;
+      bestScore = score;
+      best = lang;
+    } else if (score > runnerUp) {
+      runnerUp = score;
+    }
+  }
+
+  const asciiLetters = (sample.match(/[A-Za-z]/g) || []).length;
+  const nonAsciiLetters = (sample.match(/[^\x00-\x7F]/g) || []).length;
+  const asciiRatio = asciiLetters / Math.max(1, asciiLetters + nonAsciiLetters);
+
+  if (best && (bestScore >= 0.04 || (bestScore >= 0.025 && bestScore >= runnerUp * 1.35))) {
+    return normalizeTrackLanguageCode(best) || best;
+  }
+  if (!best && asciiRatio > 0.9 && latinLetters > 20) return 'en';
+  return null;
+}
+
+function applyContentLanguageGuesses(tracks) {
+  if (!Array.isArray(tracks)) return tracks || [];
+  return tracks.map((track) => {
+    if (!track || (track.language && track.language !== 'und')) return track;
+    const content = typeof track.content === 'string' ? track.content : null;
+    const guess = detectLanguageFromContent(content);
+    if (guess) {
+      return { ...track, language: guess, languageRaw: track.languageRaw || guess };
+    }
+    return track;
+  });
+}
+
+function collectSubtitleLanguagesFromMkv(buffer) {
+  if (!buffer || typeof buffer.byteLength !== 'number' || buffer.byteLength === 0) return [];
+  try {
+    const parseTracks = (maxScanBytes) => {
+      const headerInfo = parseMkvHeaderInfo(buffer, { maxScanBytes });
+      const subtitleTracks = (headerInfo?.tracks || []).filter((t) => {
+        const codec = (t.codecId || '').toLowerCase();
+        return t.type === 0x11 || t.type === 17 || codec.includes('s_text') || codec.includes('subtitle') || codec.includes('subrip') || codec.includes('ass') || codec.includes('pgs');
+      });
+      return subtitleTracks.map((t, idx) => {
+        const name = t.name || '';
+        const normalizedLang = normalizeTrackLanguageCode(t.languageIetf || t.language) || detectLanguageFromLabel(name) || null;
+        return {
+          index: idx,
+          trackNumber: typeof t.number === 'number' ? t.number : null,
+          lang: normalizedLang,
+          languageRaw: t.languageIetf || t.language || '',
+          name
+        };
+      }).filter(entry => !!entry.lang);
+    };
+
+    const primaryLimit = Math.min(buffer.byteLength, 24 * 1024 * 1024);
+    let langs = parseTracks(primaryLimit);
+    if (!langs.length && buffer.byteLength > primaryLimit) {
+      const deepLimit = Math.min(buffer.byteLength, 96 * 1024 * 1024);
+      if (deepLimit > primaryLimit) {
+        langs = parseTracks(deepLimit);
+      }
+    }
+    return langs;
+  } catch (_) {
+    return [];
+  }
+}
+
+function collectSubtitleLanguagesFromMp4(buffer) {
+  if (!buffer || typeof buffer.byteLength !== 'number' || buffer.byteLength === 0) return [];
+  const u8 = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+  const len = u8.length;
+  const readU32 = (off) => (u8[off] << 24 | u8[off + 1] << 16 | u8[off + 2] << 8 | u8[off + 3]) >>> 0;
+  const readStr = (off, count) => String.fromCharCode(...u8.subarray(off, off + count));
+
+  const handlersForSubs = new Set(['sbtl', 'subt', 'text', 'tx3g', 'wvtt', 'stpp', 'clcp']);
+  const tracks = [];
+
+  const walkBoxes = (start, end, visitor) => {
+    let p = start;
+    while (p + 8 <= end) {
+      const size = readU32(p);
+      const type = readStr(p + 4, 4);
+      if (!size) break;
+      const boxEnd = size === 1
+        ? Math.min(end, p + 16 + Number(readU32(p + 8)) * 2 ** 32)
+        : Math.min(end, p + size);
+      visitor(type, p + 8, boxEnd);
+      if (boxEnd <= p) break;
+      p = boxEnd;
+    }
+  };
+
+  const decodeMdhdLanguage = (mdhdStart, mdhdEnd) => {
+    if (mdhdStart + 12 >= mdhdEnd) return null;
+    const version = u8[mdhdStart];
+    const langOffset = version === 1 ? mdhdStart + 20 : mdhdStart + 12;
+    if (langOffset + 2 > mdhdEnd) return null;
+    const langBits = (u8[langOffset] << 8) | u8[langOffset + 1];
+    const c1 = ((langBits >> 10) & 0x1F) + 0x60;
+    const c2 = ((langBits >> 5) & 0x1F) + 0x60;
+    const c3 = (langBits & 0x1F) + 0x60;
+    const code = String.fromCharCode(c1, c2, c3).replace(/\0/g, '').trim();
+    if (!code || code === 'und') return null;
+    return normalizeTrackLanguageCode(code) || code;
+  };
+
+  const decodeTrackIdFromTkhd = (start, end) => {
+    const version = u8[start];
+    const idOffset = version === 1 ? start + 20 : start + 12;
+    if (idOffset + 4 > end) return null;
+    return readU32(idOffset);
+  };
+
+  const parseTrak = (trakStart, trakEnd, trakIndex) => {
+    let handler = null;
+    let lang = null;
+    let trackId = null;
+    walkBoxes(trakStart, trakEnd, (type, boxStart, boxEnd) => {
+      if (type === 'tkhd' && trackId === null) {
+        trackId = decodeTrackIdFromTkhd(boxStart, boxEnd);
+      } else if (type === 'mdia') {
+        walkBoxes(boxStart, boxEnd, (mdType, mdStart, mdEnd) => {
+          if (mdType === 'hdlr') {
+            if (mdStart + 8 <= mdEnd) {
+              handler = readStr(mdStart + 4, 4);
+            }
+          } else if (mdType === 'mdhd' && !lang) {
+            lang = decodeMdhdLanguage(mdStart, mdEnd);
+          }
+        });
+      }
+    });
+    if (!handler || !handlersForSubs.has(handler)) return;
+    if (!lang) return;
+    tracks.push({
+      index: trakIndex,
+      trackNumber: trackId !== null ? trackId : null,
+      lang,
+      languageRaw: lang,
+      name: ''
+    });
+  };
+
+  try {
+    walkBoxes(0, len, (type, start, end) => {
+      if (type === 'moov') {
+        let idx = 0;
+        walkBoxes(start, end, (innerType, innerStart, innerEnd) => {
+          if (innerType === 'trak') {
+            parseTrak(innerStart, innerEnd, idx++);
+          }
+        });
+      }
+    });
+  } catch (_) {
+    return [];
+  }
+  return tracks;
+}
+
+function collectSubtitleLanguagesFromHeader(buffer) {
+  const mkv = collectSubtitleLanguagesFromMkv(buffer);
+  if (mkv.length) return mkv;
+  const mp4 = collectSubtitleLanguagesFromMp4(buffer);
+  if (mp4.length) return mp4;
+  return [];
+}
+
+function applyHeaderLanguagesToTracks(tracks, headerLangs) {
+  if (!Array.isArray(tracks) || !tracks.length || !Array.isArray(headerLangs) || !headerLangs.length) return tracks || [];
+  const usable = headerLangs.filter((l) => l && l.lang);
+  if (!usable.length) return tracks;
+
+  const isGeneratedLabel = (label) => {
+    if (!label) return true;
+    const lower = String(label).toLowerCase();
+    if (/^extracted[_\s-]?sub/.test(lower)) return true;
+    if (/^remux[_\s-]?sub/.test(lower)) return true;
+    if (/^track\s+\d+/.test(lower)) return true;
+    if (/^subtitle\s+\d+/.test(lower)) return true;
+    return false;
+  };
+
+  return tracks.map((track, idx) => {
+    if (track?.language && track.language !== 'und') return track;
+    const numericId = Number(track?.id);
+    const langEntry = (() => {
+      if (Number.isInteger(numericId)) {
+        const byTrackNumber = usable.find((l) => l.trackNumber !== null && (l.trackNumber === numericId || l.trackNumber === numericId + 1));
+        if (byTrackNumber) return byTrackNumber;
+        const byIndex = usable.find((l) => l.index === numericId - 1 || l.index === numericId);
+        if (byIndex) return byIndex;
+      }
+      return usable[idx] || null;
+    })();
+    if (langEntry?.lang) {
+      const nextLabel = !track?.label || isGeneratedLabel(track.label)
+        ? (langEntry.name || track?.label || `Track ${idx + 1}`)
+        : track.label;
+      return {
+        ...track,
+        language: langEntry.lang,
+        label: nextLabel
+      };
+    }
+    const labelSource = [track?.label, track?.name, track?.originalLabel].find((l) => l && !isGeneratedLabel(l));
+    const labelGuess = labelSource ? detectLanguageFromLabel(labelSource) : null;
+    if (labelGuess) return { ...track, language: labelGuess };
+    return track;
+  });
+}
 
 const formatExtractedName = (index, ext = 'srt', variant = '') => {
   const num = String(index).padStart(2, '0');
@@ -295,6 +1015,398 @@ function loadScriptTag(url, label, messageId) {
       reject(err);
     }
   });
+}
+
+const PADDLE_OCR_URLS = (() => {
+  const local = (file) => {
+    try {
+      return chrome?.runtime?.getURL ? chrome.runtime.getURL(`assets/lib/paddle/${file}`) : null;
+    } catch (_) {
+      return null;
+    }
+  };
+  const core = local('paddlejs-core.js');
+  const backend = local('paddlejs-backend-webgl.js');
+  const opencv = local('paddlejs-opencv.js');
+  const ocr = local('paddlejs-ocr.js');
+  return { core, backend, opencv, ocr };
+})();
+
+const TESSERACT_URLS = (() => {
+  const url = (file) => {
+    try {
+      return chrome?.runtime?.getURL ? chrome.runtime.getURL(`assets/lib/tesseract/${file}`) : null;
+    } catch (_) {
+      return null;
+    }
+  };
+  const langBase = (() => {
+    try {
+      return chrome?.runtime?.getURL ? chrome.runtime.getURL('assets/lib/tesseract/') : null;
+    } catch (_) {
+      return null;
+    }
+  })();
+  const main = url('tesseract.min.js');
+  const worker = url('worker.min.js');
+  const core = url('tesseract-core.wasm');
+  const langPath = langBase || undefined; // directory; Tesseract appends /<lang>.traineddata
+  return { main, worker, core, langPath };
+})();
+
+let _paddleOcrReady = false;
+let _paddleOcrLoading = null;
+let _paddleCvReady = false;
+let _tesseractLoading = null;
+
+async function waitForOpencvReady(messageId) {
+  if (_paddleCvReady) return;
+  const cvReady = self?.cv?.ready;
+  if (cvReady && typeof cvReady.then === 'function') {
+    await withTimeout(cvReady, 60000, 'OpenCV (paddle) init timed out');
+    _paddleCvReady = true;
+    sendOffscreenLog('OpenCV runtime ready for PaddleOCR', 'info', messageId);
+  }
+}
+
+async function decodePngToImage(pngBytes, messageId) {
+  const bytes = pngBytes instanceof Uint8Array ? pngBytes : new Uint8Array(pngBytes || []);
+  const blob = new Blob([bytes], { type: 'image/png' });
+  const url = URL.createObjectURL(blob);
+
+  // Prefer HTMLImageElement so PaddleOCR can read naturalWidth/naturalHeight.
+  if (typeof Image === 'function') {
+    return new Promise((resolve, reject) => {
+      try {
+        const img = new Image();
+        img.decoding = 'async';
+        img.onload = () => {
+          URL.revokeObjectURL(url);
+          resolve(img);
+        };
+        img.onerror = (err) => {
+          URL.revokeObjectURL(url);
+          reject(new Error(`Image decode failed: ${err?.message || err}`));
+        };
+        img.src = url;
+      } catch (err) {
+        URL.revokeObjectURL(url);
+        reject(err);
+      }
+    });
+  }
+
+  // Fallback to drawing an ImageBitmap into a canvas with natural* metadata.
+  if (typeof createImageBitmap === 'function') {
+    const bmp = await createImageBitmap(blob);
+    const canvas = typeof document !== 'undefined' ? document.createElement('canvas') : new OffscreenCanvas(bmp.width, bmp.height);
+    canvas.width = bmp.width;
+    canvas.height = bmp.height;
+    try {
+      canvas.getContext('2d').drawImage(bmp, 0, 0);
+    } catch (_) { /* ignore */ }
+    try { bmp.close?.(); } catch (_) { /* ignore */ }
+    URL.revokeObjectURL(url);
+    // Annotate so PaddleOCR math works even if the target is a canvas.
+    canvas.naturalWidth = canvas.width;
+    canvas.naturalHeight = canvas.height;
+    return canvas;
+  }
+
+  URL.revokeObjectURL(url);
+  const err = new Error('No image decoding APIs available in offscreen context');
+  sendOffscreenLog(`OCR: ${err.message}`, 'error', messageId);
+  throw err;
+}
+
+async function ensurePaddleOcrLoaded(messageId) {
+  if (!PADDLE_OCR_URLS.core || !PADDLE_OCR_URLS.backend || !PADDLE_OCR_URLS.opencv || !PADDLE_OCR_URLS.ocr) {
+    throw new Error('PaddleOCR assets unavailable (local only, no CDN fallback)');
+  }
+  if (_paddleOcrReady && self?.paddlejs?.ocr) return self.paddlejs.ocr;
+  if (_paddleOcrLoading) return _paddleOcrLoading;
+  _paddleOcrLoading = (async () => {
+    sendOffscreenLog('Loading PaddleOCR dependencies...', 'info', messageId);
+    await loadScriptTag(PADDLE_OCR_URLS.core, 'paddlejs-core', messageId);
+    await loadScriptTag(PADDLE_OCR_URLS.backend, 'paddlejs-backend-webgl', messageId);
+    await loadScriptTag(PADDLE_OCR_URLS.opencv, 'paddlejs-mediapipe-opencv', messageId);
+    await waitForOpencvReady(messageId);
+    await loadScriptTag(PADDLE_OCR_URLS.ocr, 'paddlejs-models-ocr', messageId);
+    if (!self?.paddlejs?.ocr) {
+      throw new Error('PaddleOCR global missing after script load');
+    }
+    if (typeof self.paddlejs.ocr.init === 'function') {
+      await withTimeout(self.paddlejs.ocr.init(), 120000, 'PaddleOCR init timed out');
+    }
+    _paddleOcrReady = true;
+    sendOffscreenLog('PaddleOCR initialized', 'info', messageId);
+    return self.paddlejs.ocr;
+  })();
+  return _paddleOcrLoading;
+}
+
+async function ensureTesseractLoaded(messageId) {
+  if (_tesseractLoading) return _tesseractLoading;
+  _tesseractLoading = (async () => {
+    if (!TESSERACT_URLS.main || !TESSERACT_URLS.worker || !TESSERACT_URLS.core) {
+      throw new Error('Tesseract assets unavailable');
+    }
+    const workerUrl = TESSERACT_URLS.worker;
+    if (/^https?:/i.test(workerUrl || '')) {
+      throw new Error('Refusing CDN Tesseract worker (workerPath must be packaged)');
+    }
+    sendOffscreenLog('Loading Tesseract.js OCR...', 'info', messageId);
+    await loadScriptTag(TESSERACT_URLS.main, 'tesseract.js', messageId);
+    if (!self?.Tesseract?.createWorker) {
+      throw new Error('Tesseract global missing after script load');
+    }
+    try {
+      // Force Tesseract to use our packaged assets only.
+      self.Tesseract.setDefaultOptions?.({
+        workerPath: workerUrl,
+        corePath: TESSERACT_URLS.core,
+        langPath: TESSERACT_URLS.langPath,
+        workerBlobURL: false
+      });
+    } catch (err) {
+      console.warn('[Offscreen] Failed to set Tesseract default options', err);
+    }
+    sendOffscreenLog('Tesseract.js ready', 'info', messageId);
+    return self.Tesseract;
+  })();
+  return _tesseractLoading;
+}
+
+function parsePtsFromFilename(name) {
+  const match = name.match(/_(\d+)\.png$/i);
+  if (!match) return null;
+  const raw = Number(match[1]);
+  if (!Number.isFinite(raw)) return null;
+  if (raw > 1e9) return raw / 90000; // assume 90k clock
+  if (raw > 1e6) return raw / 1000;  // assume ms
+  if (raw > 90000) return raw / 90000;
+  if (raw > 10000) return raw / 1000;
+  return raw;
+}
+
+function formatSrtTimestamp(sec) {
+  const clamped = Math.max(0, Number.isFinite(sec) ? sec : 0);
+  const msTotal = Math.round(clamped * 1000);
+  const ms = msTotal % 1000;
+  const totalSeconds = (msTotal - ms) / 1000;
+  const s = totalSeconds % 60;
+  const totalMinutes = (totalSeconds - s) / 60;
+  const m = totalMinutes % 60;
+  const h = (totalMinutes - m) / 60;
+  const pad = (v, len = 2) => String(v).padStart(len, '0');
+  return `${pad(h)}:${pad(m)}:${pad(s)},${pad(ms, 3)}`;
+}
+
+function cuesToSrt(cues) {
+  return cues.map((cue, idx) => {
+    const start = formatSrtTimestamp(cue.start);
+    const end = formatSrtTimestamp(cue.end);
+    const text = cue.text || '';
+    return `${idx + 1}\n${start} --> ${end}\n${text.trim()}\n`;
+  }).join('\n');
+}
+
+async function runTesseractOcrOnCopiedTracks(ffmpeg, copiedTracks, messageId) {
+  const T = await ensureTesseractLoaded(messageId);
+  const worker = await T.createWorker({
+    workerPath: TESSERACT_URLS.worker,
+    corePath: TESSERACT_URLS.core,
+    langPath: TESSERACT_URLS.langPath,
+    workerBlobURL: false,
+    logger: () => {} // quiet
+  });
+  await worker.load();
+  await worker.loadLanguage('eng');
+  await worker.initialize('eng');
+
+  const tracks = [];
+  const MAX_FRAMES = 500; // keep reasonable for CPU
+  const DEFAULT_DURATION = 4;
+
+  let trackNo = 0;
+  try {
+    for (const copyName of copiedTracks) {
+      trackNo += 1;
+      const framePrefix = `tess_${String(trackNo).padStart(2, '0')}_`;
+      sendOffscreenLog(`OCR (Tesseract): exporting bitmaps for ${copyName}...`, 'info', messageId);
+      await ffmpeg.run(
+        '-y',
+        '-analyzeduration', '60M',
+        '-probesize', '60M',
+        '-i', copyName,
+        '-map', '0:s:0',
+        '-vsync', '0',
+        '-frame_pts', '1',
+        `${framePrefix}%05d.png`
+      );
+
+      let frameFiles = ffmpeg.FS('readdir', '/')
+        .filter(f => f.startsWith(framePrefix) && f.endsWith('.png'))
+        .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+
+      if (!frameFiles.length) {
+        sendOffscreenLog(`OCR (Tesseract): no bitmap frames for ${copyName}`, 'warn', messageId);
+        continue;
+      }
+      if (frameFiles.length > MAX_FRAMES) {
+        sendOffscreenLog(`OCR (Tesseract): limiting frames for ${copyName} to ${MAX_FRAMES} (had ${frameFiles.length})`, 'warn', messageId);
+        frameFiles = frameFiles.slice(0, MAX_FRAMES);
+      }
+
+      const cues = [];
+      for (let i = 0; i < frameFiles.length; i++) {
+        const file = frameFiles[i];
+        const data = ffmpeg.FS('readFile', file);
+        let img = null;
+        try {
+          img = await decodePngToImage(data, messageId);
+        } catch (imgErr) {
+          sendOffscreenLog(`OCR (Tesseract): failed to decode frame ${file}: ${imgErr?.message || imgErr}`, 'warn', messageId);
+          continue;
+        }
+        try {
+          const result = await worker.recognize(img);
+          const text = (result?.data?.text || '').trim();
+          if (!text) continue;
+          const startSec = parsePtsFromFilename(file);
+          const nextStart = i < frameFiles.length - 1 ? parsePtsFromFilename(frameFiles[i + 1]) : null;
+          const endSec = Number.isFinite(nextStart) && nextStart > (startSec || 0)
+            ? nextStart
+            : (startSec || 0) + DEFAULT_DURATION;
+          cues.push({ start: startSec || 0, end: endSec, text });
+        } catch (ocrErr) {
+          sendOffscreenLog(`OCR (Tesseract): failed on ${file}: ${ocrErr?.message || ocrErr}`, 'warn', messageId);
+        }
+      }
+
+      for (const f of frameFiles) {
+        try { ffmpeg.FS('unlink', f); } catch (_) { }
+      }
+
+      if (!cues.length) {
+        sendOffscreenLog(`OCR (Tesseract): no text produced for ${copyName}`, 'warn', messageId);
+        continue;
+      }
+
+      const srtContent = cuesToSrt(cues);
+      tracks.push({
+        id: String(trackNo),
+        label: `OCR Track ${trackNo} (Tesseract)`,
+        language: 'eng',
+        codec: 'srt',
+        source: 'ocr',
+        binary: false,
+        byteLength: srtContent.length,
+        content: srtContent
+      });
+    }
+  } finally {
+    try { await worker.terminate(); } catch (_) { }
+  }
+
+  return tracks;
+}
+
+async function runPaddleOcrOnCopiedTracks(ffmpeg, copiedTracks, messageId) {
+  const ocr = await ensurePaddleOcrLoaded(messageId);
+  const tracks = [];
+  const MAX_FRAMES = 2000;
+  const DEFAULT_DURATION = 4; // seconds
+
+  let trackNo = 0;
+  for (const copyName of copiedTracks) {
+    trackNo += 1;
+    sendOffscreenLog(`OCR: exporting bitmaps for ${copyName}...`, 'info', messageId);
+    const framePrefix = `ocr_${String(trackNo).padStart(2, '0')}_`;
+    // Extract all subtitle bitmaps with pts in filenames
+    await ffmpeg.run(
+      '-y',
+      '-analyzeduration', '60M',
+      '-probesize', '60M',
+      '-i', copyName,
+      '-map', '0:s:0',
+      '-vsync', '0',
+      '-frame_pts', '1',
+      `${framePrefix}%05d.png`
+    );
+
+    let frameFiles = ffmpeg.FS('readdir', '/')
+      .filter(f => f.startsWith(framePrefix) && f.endsWith('.png'))
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+
+    if (!frameFiles.length) {
+      sendOffscreenLog(`OCR: no bitmap frames exported for ${copyName}`, 'warn', messageId);
+      continue;
+    }
+
+    if (frameFiles.length > MAX_FRAMES) {
+      sendOffscreenLog(`OCR: limiting frames for ${copyName} to ${MAX_FRAMES} (had ${frameFiles.length})`, 'warn', messageId);
+      frameFiles = frameFiles.slice(0, MAX_FRAMES);
+    }
+
+    const cues = [];
+    for (let i = 0; i < frameFiles.length; i++) {
+      const file = frameFiles[i];
+      const data = ffmpeg.FS('readFile', file);
+      let img = null;
+      try {
+        img = await decodePngToImage(data, messageId);
+      } catch (imgErr) {
+        sendOffscreenLog(`OCR: failed to decode frame ${file}: ${imgErr?.message || imgErr}`, 'warn', messageId);
+        continue;
+      }
+
+      let result = null;
+      if (typeof ocr?.detect === 'function') {
+        result = await ocr.detect(img);
+      } else if (typeof ocr?.recognize === 'function') {
+        result = await ocr.recognize(img);
+      } else {
+        throw new Error('PaddleOCR API missing (detect/recognize not found)');
+      }
+
+      const texts = Array.isArray(result?.text) ? result.text : Array.isArray(result) ? result.map(r => r?.text || r).filter(Boolean) : [];
+      const text = (texts || []).filter(Boolean).map(String).join('\n').trim();
+      if (!text) {
+        continue;
+      }
+      const startSec = parsePtsFromFilename(file);
+      const nextStart = i < frameFiles.length - 1 ? parsePtsFromFilename(frameFiles[i + 1]) : null;
+      const endSec = Number.isFinite(nextStart) && nextStart > (startSec || 0)
+        ? nextStart
+        : (startSec || 0) + DEFAULT_DURATION;
+      cues.push({ start: startSec || 0, end: endSec, text });
+    }
+
+    // Cleanup frames to keep FS tidy
+    for (const f of frameFiles) {
+      try { ffmpeg.FS('unlink', f); } catch (_) { }
+    }
+
+    if (!cues.length) {
+      sendOffscreenLog(`OCR: no text produced for ${copyName}`, 'warn', messageId);
+      continue;
+    }
+
+    const srtContent = cuesToSrt(cues);
+    tracks.push({
+      id: String(trackNo),
+      label: `OCR Track ${trackNo} (PaddleOCR)`,
+      language: 'und',
+      codec: 'srt',
+      source: 'ocr',
+      binary: false,
+      byteLength: srtContent.length,
+      content: srtContent
+    });
+  }
+
+  return tracks;
 }
 
 function isHttpUrl(url) {
@@ -709,6 +1821,30 @@ async function demuxSubtitles(buffer, messageId) {
   const skippedCopies = copiedTracks.length;
 
   if (!files.length) {
+    if (copiedTracks.length) {
+      let ocrTracks = [];
+      try {
+        ocrTracks = await runPaddleOcrOnCopiedTracks(ffmpeg, copiedTracks, messageId);
+        if (ocrTracks.length) {
+          sendOffscreenLog(`OCR (PaddleOCR) extracted ${ocrTracks.length} subtitle track(s) from image-based streams`, 'info', messageId);
+          return normalizeExtractedTracks(ocrTracks);
+        }
+      } catch (ocrErr) {
+        sendOffscreenLog(`OCR failed: ${ocrErr?.message || ocrErr}`, 'error', messageId);
+      }
+      // Fallback to Tesseract if Paddle fails or produces no text
+      try {
+        ocrTracks = await runTesseractOcrOnCopiedTracks(ffmpeg, copiedTracks, messageId);
+        if (ocrTracks.length) {
+          sendOffscreenLog(`OCR (Tesseract) extracted ${ocrTracks.length} subtitle track(s) from image-based streams`, 'info', messageId);
+          return normalizeExtractedTracks(ocrTracks);
+        }
+      } catch (tessErr) {
+        sendOffscreenLog(`Tesseract OCR failed: ${tessErr?.message || tessErr}`, 'error', messageId);
+      }
+      sendOffscreenLog('Detected subtitle streams (likely image/bitmap, e.g., PGS/VobSub) that cannot be converted to SRT. OCR was attempted but no text was produced.', 'error', messageId);
+      throw new Error('Image-based subtitle streams require OCR; no text could be produced.');
+    }
     sendOffscreenLog('FFmpeg completed but no subtitle streams were found.', 'warn', messageId);
     throw new Error('No subtitle streams found in media.');
   }
@@ -901,6 +2037,13 @@ async function demuxSubtitles(buffer, messageId) {
     }
   }
 
+  // Attach language metadata from container headers before returning
+  const headerLangs = collectSubtitleLanguagesFromHeader(buffer);
+  if (headerLangs.length) {
+    tracks = applyHeaderLanguagesToTracks(tracks, headerLangs);
+  }
+  tracks = applyContentLanguageGuesses(tracks);
+
   // Apply consistent naming/numbering for all outputs
   tracks = normalizeExtractedTracks(tracks);
 
@@ -1029,10 +2172,15 @@ async function extractSubtitlesViaVideo(streamUrl, mode, messageId) {
             const sizeKb = Math.round((content.length / 1024) * 10) / 10;
             sendOffscreenLog(`Track ${trackIndex}: extracted ${cues.length} cues (${sizeKb} KB)`, 'info', messageId);
 
+            const langFromTrack = normalizeTrackLanguageCode(track.srclang || trackObj.language);
+            const langGuess = detectLanguageFromLabel(track.label || trackObj.label || '');
+            const langFromContent = detectLanguageFromContent(content);
+            const language = langFromTrack || langFromContent || langGuess || 'und';
+
             resolveTrack({
               id: String(trackIndex + 1),
               label: track.label || trackObj.label || `Track ${trackIndex + 1}`,
-              language: track.srclang || trackObj.language || 'und',
+              language,
               codec: 'srt',
               binary: false,
               byteLength: content.length,
@@ -1227,6 +2375,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     hasBuffer: !!message?.buffer,
     windowCount: Array.isArray(message?.windows) ? message.windows.length : undefined
   });
+  if (message?.type === 'OFFSCREEN_PING') {
+    try { sendResponse?.({ ok: true, ts: Date.now() }); } catch (_) { }
+    return false;
+  }
   if (message?.type === 'OFFSCREEN_FFMPEG_BUFFER_CHUNK') {
     const res = stashChunk(message.transferId, message.chunkIndex, message.totalChunks, message.chunk, message.expectedBytes, message.chunkArray);
     const shouldLogChunk = message.totalChunks <= 20 || message.chunkIndex === 0 || message.chunkIndex === message.totalChunks - 1 || ((message.chunkIndex + 1) % 25 === 0);
