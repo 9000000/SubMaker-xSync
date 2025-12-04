@@ -153,12 +153,6 @@ function applyTranslations() {
   if (themeDarkLabel) themeDarkLabel.textContent = tOpt('themeDark', 'Dark');
   const themeTrueDarkLabel = document.getElementById('themeTrueDarkLabel');
   if (themeTrueDarkLabel) themeTrueDarkLabel.textContent = tOpt('themeTrueDark', 'True Dark');
-  const themeLightLabel = document.getElementById('themeLightLabel');
-  if (themeLightLabel) themeLightLabel.textContent = t('xsync.options.themeLight', {}, 'Light');
-  const themeDarkLabel = document.getElementById('themeDarkLabel');
-  if (themeDarkLabel) themeDarkLabel.textContent = t('xsync.options.themeDark', {}, 'Dark');
-  const themeTrueDarkLabel = document.getElementById('themeTrueDarkLabel');
-  if (themeTrueDarkLabel) themeTrueDarkLabel.textContent = t('xsync.options.themeTrueDark', {}, 'True Dark');
 
   const syncEyebrow = document.getElementById('syncEyebrow');
   if (syncEyebrow) syncEyebrow.textContent = tOpt('syncEyebrow', 'Sync Behaviour');

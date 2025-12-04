@@ -8,6 +8,10 @@ console.log('[SubMaker xSync] Content script loaded');
 // State management
 let extensionReady = false;
 const pendingExtractResults = new Map();
+const CONFIG_TOKEN_STORAGE_KEY = 'submaker_session_token';
+const DEFAULT_TOOLBOX_VIDEO_ID = 'Stream and Refresh';
+const DEFAULT_TOOLBOX_FILENAME = 'Stream and Refresh';
+const INSTALL_URL_INPUT_IDS = ['installUrlDisplay', 'installUrlBox'];
 
 function translate(key, fallback) {
   try {
@@ -37,6 +41,19 @@ function safeHostname(url) {
   }
 }
 
+function safeUrl(raw) {
+  try {
+    return new URL(raw);
+  } catch (_) {
+    return null;
+  }
+}
+
+function safeOrigin(raw) {
+  const parsed = safeUrl(raw);
+  return parsed ? parsed.origin : null;
+}
+
 function extractConfigToken(fromUrl) {
   if (!fromUrl) return null;
   try {
@@ -53,32 +70,106 @@ function extractConfigToken(fromUrl) {
     if (toolboxIdx !== -1 && parts.length > toolboxIdx + 1) {
       return parts[toolboxIdx + 1];
     }
+    const addonIdx = parts.findIndex(p => p.toLowerCase() === 'addon');
+    if (addonIdx !== -1 && parts.length > addonIdx + 1) {
+      return parts[addonIdx + 1];
+    }
     return null;
   } catch (_) {
     return null;
   }
 }
 
-function deriveConfigureUrl(fromUrl, tokenOverride) {
+function mergeSearchParams(seedUrls = [], overrides = {}, defaults = {}) {
+  const params = new URLSearchParams();
+  seedUrls.forEach((raw) => {
+    const parsed = safeUrl(raw);
+    if (!parsed) return;
+    parsed.searchParams.forEach((value, key) => {
+      params.set(key, value);
+    });
+  });
+  Object.entries(overrides || {}).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === '') return;
+    params.set(key, value);
+  });
+  Object.entries(defaults || {}).forEach(([key, value]) => {
+    const existing = params.get(key);
+    if (existing === null || existing === undefined || existing === '') {
+      params.set(key, value);
+    }
+  });
+  const sorted = new URLSearchParams();
+  Array.from(params.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .forEach(([key, value]) => sorted.append(key, value));
+  return sorted;
+}
+
+function deriveConfigureUrl(fromUrl, tokenOverride, fallbackUrl) {
+  const baseOrigin = safeOrigin(fromUrl) || safeOrigin(fallbackUrl);
+  if (!baseOrigin) return null;
+  const config = tokenOverride || extractConfigToken(fromUrl) || extractConfigToken(fallbackUrl);
+  const url = new URL('/configure', baseOrigin);
+  const params = mergeSearchParams([fallbackUrl, fromUrl], { config }, {});
+  url.search = params.toString();
+  return url.toString();
+}
+
+function deriveToolboxUrl(fromUrl, tokenOverride, existingUrl) {
+  const baseOrigin = safeOrigin(fromUrl) || safeOrigin(existingUrl);
+  if (!baseOrigin) return null;
+  const config = tokenOverride || extractConfigToken(fromUrl) || extractConfigToken(existingUrl);
+  const params = mergeSearchParams(
+    [existingUrl, fromUrl],
+    { config },
+    { videoId: DEFAULT_TOOLBOX_VIDEO_ID, filename: DEFAULT_TOOLBOX_FILENAME }
+  );
+  const url = new URL('/sub-toolbox', baseOrigin);
+  url.search = params.toString();
+  return url.toString();
+}
+
+function readInstallUrl() {
   try {
-    const url = new URL(fromUrl);
-    const config = tokenOverride || extractConfigToken(fromUrl);
-    const suffix = config ? `?config=${encodeURIComponent(config)}` : '';
-    return `${url.origin}/configure${suffix}`;
+    if (typeof window !== 'undefined' && typeof window.installUrl === 'string' && window.installUrl) {
+      return window.installUrl;
+    }
+  } catch (_) {}
+  for (const id of INSTALL_URL_INPUT_IDS) {
+    try {
+      const el = document.getElementById(id);
+      if (!el) continue;
+      const candidate = (el.value || el.textContent || '').trim();
+      if (candidate) return candidate;
+    } catch (_) {}
+  }
+  return null;
+}
+
+function readStoredSessionToken() {
+  try {
+    const token = localStorage.getItem(CONFIG_TOKEN_STORAGE_KEY);
+    return token || null;
   } catch (_) {
     return null;
   }
 }
 
-function deriveToolboxUrl(fromUrl, tokenOverride) {
-  try {
-    const url = new URL(fromUrl);
-    const config = tokenOverride || extractConfigToken(fromUrl);
-    const suffix = config ? `?config=${encodeURIComponent(config)}` : '';
-    return `${url.origin}/sub-toolbox${suffix}`;
-  } catch (_) {
-    return null;
-  }
+function hasToolboxParams(url) {
+  const parsed = safeUrl(url);
+  if (!parsed) return false;
+  const videoId = parsed.searchParams.get('videoId');
+  const filename = parsed.searchParams.get('filename');
+  return !!(videoId && filename);
+}
+
+function normalizeUrlForCompare(url) {
+  const parsed = safeUrl(url);
+  if (!parsed) return url || '';
+  parsed.hash = '';
+  parsed.search = mergeSearchParams([parsed.toString()]).toString();
+  return parsed.toString();
 }
 
 function clearPendingExtract(messageId) {
@@ -214,40 +305,34 @@ chrome.runtime.onMessage.addListener((msg) => {
             currentHost
           });
         } else {
-          const currentToken = extractConfigToken(currentUrl);
+          const installUrl = readInstallUrl();
+          const currentToken = extractConfigToken(currentUrl) || extractConfigToken(installUrl) || readStoredSessionToken();
           const storedToken = extractConfigToken(existing.configureUrl) || extractConfigToken(existing.toolboxUrl);
-          const tokenChanged = isConfigurePage && currentToken && storedToken && currentToken !== storedToken;
-          const hasFreshToken = isConfigurePage && currentToken && !storedToken;
+          const tokenChanged = currentToken && storedToken && currentToken !== storedToken;
+          const hasFreshToken = currentToken && !storedToken;
 
-          if (isConfigurePage) {
-            const normalizedConfigure = deriveConfigureUrl(currentUrl, currentToken) || currentUrl;
-            if (!existing.configureUrl || tokenChanged || hasFreshToken) {
-              storageUpdates.configureUrl = normalizedConfigure;
-            }
-
-            const derivedToolboxFromConfig = deriveToolboxUrl(currentUrl, currentToken);
-            if (derivedToolboxFromConfig && (!existing.toolboxUrl || tokenChanged || hasFreshToken)) {
-              storageUpdates.toolboxUrl = derivedToolboxFromConfig;
-            }
-          } else {
-            if (isToolboxPage && !existing.toolboxUrl) {
-              storageUpdates.toolboxUrl = currentUrl;
-            }
-            if (!existing.toolboxUrl && !storageUpdates.toolboxUrl) {
-              const derivedToolbox = deriveToolboxUrl(currentUrl, currentToken);
-              if (derivedToolbox) {
-                storageUpdates.toolboxUrl = derivedToolbox;
-              }
-            }
-            if (!existing.configureUrl && !storageUpdates.configureUrl) {
-              const derivedConfigure = deriveConfigureUrl(currentUrl, currentToken);
-              if (derivedConfigure) {
-                storageUpdates.configureUrl = derivedConfigure;
-              }
-            }
+          const normalizedConfigure = deriveConfigureUrl(
+            currentUrl || existing.configureUrl || installUrl,
+            currentToken || storedToken,
+            existing.configureUrl || installUrl
+          ) || currentUrl;
+          const configureChanged = normalizedConfigure && existing.configureUrl && normalizeUrlForCompare(existing.configureUrl) !== normalizeUrlForCompare(normalizedConfigure);
+          if (normalizedConfigure && (!existing.configureUrl || tokenChanged || hasFreshToken || configureChanged)) {
+            storageUpdates.configureUrl = normalizedConfigure;
           }
 
-          if (isSyncPage && !existing.syncUrl) {
+          const derivedToolbox = deriveToolboxUrl(
+            currentUrl || existing.toolboxUrl || installUrl,
+            currentToken || storedToken,
+            existing.toolboxUrl || existing.configureUrl
+          );
+          const toolboxChanged = derivedToolbox && existing.toolboxUrl && normalizeUrlForCompare(existing.toolboxUrl) !== normalizeUrlForCompare(derivedToolbox);
+          const toolboxMissingParams = !hasToolboxParams(existing.toolboxUrl);
+          if (derivedToolbox && (!existing.toolboxUrl || tokenChanged || hasFreshToken || toolboxChanged || toolboxMissingParams)) {
+            storageUpdates.toolboxUrl = derivedToolbox;
+          }
+
+          if (isSyncPage && (!existing.syncUrl || !existing.syncUrl.length)) {
             storageUpdates.syncUrl = currentUrl;
           }
         }
