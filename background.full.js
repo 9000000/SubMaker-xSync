@@ -953,6 +953,325 @@ async function transcribeAudioWindows(audioWindows, mode, onProgress, ctx = null
   return transcript;
 }
 
+function formatTimestampForSrt(seconds = 0) {
+  const clamped = Math.max(0, Number(seconds) || 0);
+  const hrs = Math.floor(clamped / 3600);
+  const mins = Math.floor((clamped % 3600) / 60);
+  const secs = Math.floor(clamped % 60);
+  const ms = Math.floor((clamped - Math.floor(clamped)) * 1000);
+  const pad = (v, len = 2) => String(v).padStart(len, '0');
+  return `${pad(hrs)}:${pad(mins)}:${pad(secs)},${pad(ms, 3)}`;
+}
+
+function segmentsToSrt(segments = []) {
+  if (!Array.isArray(segments) || segments.length === 0) return '';
+  const lines = [];
+  segments.forEach((seg, idx) => {
+    const start = formatTimestampForSrt(seg.start || seg.start_time || 0);
+    const end = formatTimestampForSrt(seg.end || seg.end_time || (Number(seg.start || 0) + 4));
+    const text = (seg.text || seg.transcript || '').toString().trim() || '[...]';
+    lines.push(String(idx + 1));
+    lines.push(`${start} --> ${end}`);
+    lines.push(text);
+    lines.push('');
+  });
+  return lines.join('\n');
+}
+
+async function runCloudflareTranscription(audioBlob, opts = {}, ctx = null) {
+  const accountId = (opts.accountId || '').trim();
+  const token = (opts.token || '').trim();
+  if (!accountId || !token) {
+    throw new Error('Cloudflare Workers AI credentials are missing');
+  }
+  const model = (opts.model || '@cf/openai/whisper').trim();
+  const endpoint = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${encodeURI(model)}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60000);
+  const audioBuffer = await audioBlob.arrayBuffer();
+  const contentType = audioBlob?.type || 'audio/wav';
+  let response;
+  let raw = '';
+  let attemptedJson = false;
+  const mustUseJson = opts.forceJson === true || !!opts.sourceLanguage || opts.diarization === true;
+  const sendBinary = async () => {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/json',
+        'Content-Type': contentType
+      },
+      body: audioBuffer,
+      signal: controller.signal
+    });
+    raw = await response.text();
+  };
+  const sendJsonArray = async () => {
+    attemptedJson = true;
+    const payload = {
+      audio: Array.from(new Uint8Array(audioBuffer))
+    };
+    if (opts.sourceLanguage) payload.language = opts.sourceLanguage;
+    if (opts.diarization) payload.diarization = true;
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/json',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+    raw = await response.text();
+  };
+
+  try {
+    // Cloudflare's /ai/run whisper endpoint expects either raw binary audio or a JSON array payload.
+    // Multipart form uploads are not accepted and lead to "Invalid audio input" errors.
+    if (mustUseJson) {
+      await sendJsonArray();
+    } else {
+      await sendBinary();
+      if (!response?.ok) {
+        const bodyLower = (raw || '').toLowerCase();
+        const retryable =
+          response.status === 415 ||
+          response.status === 400 ||
+          bodyLower.includes('invalid audio') ||
+          bodyLower.includes('unsupported audio input') ||
+          bodyLower.includes('different language') ||
+          bodyLower.includes('language');
+        if (retryable && !attemptedJson) {
+          await sendJsonArray();
+        }
+      }
+    }
+  } catch (err) {
+    clearTimeout(timer);
+    if (err?.name === 'AbortError') {
+      throw new Error('Cloudflare transcription timed out');
+    }
+    throw new Error(err?.message || 'Cloudflare request failed');
+  }
+  clearTimeout(timer);
+  let data = null;
+  try {
+    data = raw ? JSON.parse(raw) : null;
+  } catch (_) {
+    data = null;
+  }
+  if (!response?.ok) {
+    const cfMessage =
+      data?.errors?.[0]?.message ||
+      data?.result?.errors?.[0]?.message ||
+      data?.error ||
+      data?.message ||
+      (raw ? raw.slice(0, 400) : '');
+    const error = new Error(cfMessage || `Cloudflare Workers AI request failed (${response?.status || 'n/a'})`);
+    error.cfStatus = response?.status || null;
+    error.cfBody = raw || '';
+    throw error;
+  }
+  const result = data?.result || data?.data || data;
+  const segments = Array.isArray(result?.segments) ? result.segments : [];
+  const language = result?.language || result?.detected_language || result?.detectedLanguage || '';
+  return {
+    segments,
+    language,
+    status: response?.status || null,
+    raw: result,
+    cfBody: raw ? raw.slice(0, 400) : ''
+  };
+}
+
+async function transcribeWindowsWithCloudflare(audioWindows, opts = {}, onProgress, ctx = null) {
+  if (!Array.isArray(audioWindows) || !audioWindows.length) {
+    throw new Error('No audio windows to transcribe');
+  }
+  if (ctx?.tabId) {
+    const totalBytes = audioWindows.reduce((sum, w) => sum + (w?.audioBlob?.size || 0), 0);
+    sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare transcription starting (${audioWindows.length} window(s), totalBytes=${totalBytes})`, 'info');
+  }
+  const allSegments = [];
+  let lastStatus = null;
+  let lastBody = '';
+  let detectedLang = '';
+  let forcedLang = (opts.sourceLanguage || '').trim() || null;
+  const langCandidates = (() => {
+    const list = [];
+    if (forcedLang) list.push(forcedLang);
+    list.push('en', 'ja'); // common alternates for mixed content
+    return Array.from(new Set(list.filter(Boolean)));
+  })();
+  const totalBytes = audioWindows.reduce((sum, w) => sum + (w?.audioBlob?.size || 0), 0);
+  const CF_MAX_WAV_BYTES = 4 * 1024 * 1024; // Guard below observed effective limit despite docs quoting higher
+  audioWindows.forEach((win, idx) => {
+    const size = win?.audioBlob?.size || 0;
+    if (size > CF_MAX_WAV_BYTES) {
+      const mb = Math.round((size / (1024 * 1024)) * 10) / 10;
+      throw new Error(`Audio window ${idx + 1} is too large for Cloudflare (~${mb} MB > ~5 MB limit); use shorter windows.`);
+    }
+  });
+  // Detect language on the first window if not provided
+  let startIdx = 0;
+  if (!forcedLang && audioWindows.length) {
+    const firstWin = audioWindows[0];
+    const offsetSec = Number(firstWin?.startMs || 0) / 1000;
+    onProgress?.(15, `Detecting language on window 1/${audioWindows.length}...`);
+    if (ctx?.tabId) {
+      sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare (detect): window 1/${audioWindows.length}, offset=${Math.round(offsetSec * 1000) / 1000}s, size=${firstWin?.audioBlob?.size || 0} bytes`, 'info');
+    }
+    let detectRes = null;
+    let langAttemptIdx = 0;
+    try {
+      detectRes = await runCloudflareTranscription(firstWin.audioBlob, {
+        accountId: opts.accountId,
+        token: opts.token,
+        model: opts.model,
+        sourceLanguage: undefined,
+        diarization: opts.diarization,
+        filename: opts.filename ? `${opts.filename}_1.wav` : `audio_1.wav`
+      }, ctx);
+    } catch (err) {
+      const msg = (err?.message || '').toLowerCase();
+      const needsForcedLang = msg.includes('different language') || msg.includes('unsupported audio input') || msg.includes('language');
+      const fallbackLang = langCandidates[langAttemptIdx] || 'en';
+      if (needsForcedLang) {
+        if (ctx?.tabId) {
+          sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare detect failed (${err?.message || err}); retrying with forced language=${fallbackLang}`, 'warn');
+        }
+        forcedLang = fallbackLang;
+        let lastErr = err;
+        while (langAttemptIdx < langCandidates.length) {
+          const lang = langCandidates[langAttemptIdx];
+          langAttemptIdx += 1;
+          try {
+            detectRes = await runCloudflareTranscription(firstWin.audioBlob, {
+              accountId: opts.accountId,
+              token: opts.token,
+              model: opts.model,
+              sourceLanguage: lang,
+              diarization: opts.diarization,
+              filename: opts.filename ? `${opts.filename}_1.wav` : `audio_1.wav`,
+              forceJson: true // ensure language is honored
+            }, ctx);
+            forcedLang = lang;
+            break;
+          } catch (langErr) {
+            lastErr = langErr;
+            if (ctx?.tabId) {
+              sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare detect retry failed for lang=${lang}: ${langErr?.message || langErr}`, 'warn');
+            }
+          }
+        }
+        if (!detectRes) {
+          throw lastErr || err;
+        }
+      } else {
+        throw err;
+      }
+    }
+    lastStatus = detectRes.status || lastStatus;
+    lastBody = detectRes.cfBody || lastBody;
+    detectedLang = detectRes.language || '';
+    forcedLang = detectRes.language || forcedLang || null;
+    const segs = Array.isArray(detectRes.segments) ? detectRes.segments : [];
+    const adjusted = segs.map((seg) => ({
+      ...seg,
+      start: (seg.start || seg.start_time || 0) + offsetSec,
+      end: (seg.end || seg.end_time || (Number(seg.start || 0) + 4)) + offsetSec
+    }));
+    allSegments.push(...adjusted);
+    if (ctx?.tabId) {
+      sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare detect complete (${segs.length} segments, lang=${detectRes.language || 'n/a'})`, 'info');
+    }
+    startIdx = 1;
+  }
+
+  if (!forcedLang) {
+    // Fallback to user-provided hint if detection failed
+    forcedLang = (opts.sourceLanguage || '').trim() || null;
+  }
+
+  for (let i = startIdx; i < audioWindows.length; i++) {
+    const win = audioWindows[i];
+    const offsetSec = Number(win?.startMs || 0) / 1000;
+    onProgress?.(15 + ((i / audioWindows.length) * 50), `Transcribing window ${i + 1}/${audioWindows.length}...`);
+    if (ctx?.tabId) {
+      sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare: window ${i + 1}/${audioWindows.length}, offset=${Math.round(offsetSec * 1000) / 1000}s, size=${win?.audioBlob?.size || 0} bytes`, 'info');
+    }
+    const langOrder = (() => {
+      const order = [];
+      if (forcedLang) order.push(forcedLang);
+      langCandidates.forEach((l) => { if (!order.includes(l)) order.push(l); });
+      if (!order.length) order.push(null);
+      return order;
+    })();
+    let res = null;
+    let lastErr = null;
+    for (const lang of langOrder) {
+      try {
+        res = await runCloudflareTranscription(win.audioBlob, {
+          accountId: opts.accountId,
+          token: opts.token,
+          model: opts.model,
+          sourceLanguage: lang || undefined,
+          diarization: opts.diarization,
+          filename: opts.filename ? `${opts.filename}_${i + 1}.wav` : `audio_${i + 1}.wav`,
+          forceJson: !!lang
+        }, ctx);
+        forcedLang = lang || forcedLang; // stick with the last successful language
+        break;
+      } catch (err) {
+        lastErr = err;
+        const msg = (err?.message || '').toLowerCase();
+        const needsSwitch = msg.includes('different language') || msg.includes('unsupported audio input') || msg.includes('language');
+        if (!needsSwitch) {
+          throw err;
+        }
+        if (ctx?.tabId) {
+          sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare window ${i + 1} failed for lang=${lang || 'auto'}: ${err?.message || err}`, 'warn');
+        }
+      }
+    }
+    if (!res) {
+      throw lastErr || new Error('Cloudflare transcription failed for all language attempts');
+    }
+    lastStatus = res.status || lastStatus;
+    lastBody = res.cfBody || lastBody;
+    detectedLang = res.language || detectedLang || forcedLang || '';
+    const segs = Array.isArray(res.segments) ? res.segments : [];
+    const adjusted = segs.map((seg) => ({
+      ...seg,
+      start: (seg.start || seg.start_time || 0) + offsetSec,
+      end: (seg.end || seg.end_time || (Number(seg.start || 0) + 4)) + offsetSec
+    }));
+    allSegments.push(...adjusted);
+    if (ctx?.tabId) {
+      sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare window ${i + 1} complete (${segs.length} segments, offset=${offsetSec.toFixed(3)}s, lang=${res.language || forcedLang || 'n/a'})`, 'info');
+    }
+  }
+  allSegments.sort((a, b) => (a.start || 0) - (b.start || 0));
+  onProgress?.(70, 'Building transcript...');
+  const srt = segmentsToSrt(allSegments);
+  if (ctx?.tabId) {
+    sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare transcription complete (${allSegments.length} segments, lang=${detectedLang || opts.sourceLanguage || 'und'}, status=${lastStatus || 'n/a'})`, 'info');
+  }
+  return {
+    srt,
+    languageCode: detectedLang || opts.sourceLanguage || 'und',
+    segmentCount: allSegments.length,
+    cfStatus: lastStatus,
+    cfBody: lastBody,
+    model: opts.model || '@cf/openai/whisper',
+    audioBytes: totalBytes,
+    audioSource: 'extension',
+    contentType: 'audio/wav'
+  };
+}
+
 /**
  * Handle messages from content script
  */
@@ -1002,6 +1321,16 @@ function __xsyncHandleMessage(message, sender, sendResponse) {
           reply({ success: false, error: error?.message || 'Unknown error' });
         });
       // Explicitly keep the message channel alive for the async response.
+      return true;
+    }
+
+    if (message?.type === 'AUTOSUB_REQUEST') {
+      handleAutoSubRequest(message, sender.tab?.id)
+        .then(reply)
+        .catch((error) => {
+          console.error('[Background] Auto-sub error:', error);
+          reply({ success: false, error: error?.message || 'Unknown error' });
+        });
       return true;
     }
 
@@ -1256,12 +1585,13 @@ async function handleExtractSubsRequest(message, tabId, mode) {
  * Extract audio from video stream
  */
 
-async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = null) {
+async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = null, opts = {}) {
   const normalizedPlan = normalizeSyncPlan(planInput);
   const normalizedMode = 'single';
   console.log('[Background] Extracting audio from:', streamUrl, 'plan:', normalizedPlan);
   if (ctx?.tabId) {
-    sendDebugLog(ctx.tabId, ctx.messageId, `Extract request: plan=${describePlanForLog(normalizedPlan)}`, 'info');
+    const host = (() => { try { return new URL(streamUrl || '').hostname; } catch (_) { return streamUrl || ''; } })();
+    sendDebugLog(ctx.tabId, ctx.messageId, `Extract request: host=${host || 'n/a'} plan=${describePlanForLog(normalizedPlan)}`, 'info');
   }
   const baseHeaders = (() => {
     const h = ctx?.pageHeaders || {};
@@ -1271,10 +1601,17 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
     if (h.userAgent) headers['User-Agent'] = h.userAgent;
     return Object.keys(headers).length ? headers : null;
   })();
+  if (ctx?.tabId && baseHeaders) {
+    sendDebugLog(ctx.tabId, ctx.messageId, `Using page headers for extract (referer=${baseHeaders.Referer ? 'yes' : 'no'}, ua=${baseHeaders['User-Agent'] ? 'yes' : 'no'}, cookies=${baseHeaders.Cookie ? 'yes' : 'no'})`, 'info');
+  }
 
   try {
     const isHls = /\.m3u8(\?|$)/i.test(streamUrl);
     const isDash = /\.mpd(\?|$)/i.test(streamUrl);
+    const wantsFullStream = normalizedPlan.fullScan === true || normalizedPlan.coveragePct >= 0.99 || normalizedPlan.preset === 'complete';
+    if (ctx?.tabId) {
+      sendDebugLog(ctx.tabId, ctx.messageId, `Stream type detection: HLS=${isHls} DASH=${isDash}`, 'info');
+    }
     let detectedDuration = Number.isFinite(normalizedPlan.durationSeconds) ? normalizedPlan.durationSeconds : null;
     let audioWindows = [];
 
@@ -1303,7 +1640,7 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
         normalizedMode,
         (p) => onProgress(60 + p * 0.35),
         ctx,
-        { strictWhenTooFew: true, allowPartialOnStrictFail: false, requireAll: true }
+        { strictWhenTooFew: true, allowPartialOnStrictFail: false, requireAll: true, audioStreamIndex: opts?.audioStreamIndex }
       );
       onProgress(96);
       return audioWindows;
@@ -1313,13 +1650,88 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
     if (probedDuration && !detectedDuration) detectedDuration = probedDuration;
 
     const sampleOpts = normalizedPlan.fullScan ? { minBytes: 192 * 1024 * 1024, maxBytesCap: 768 * 1024 * 1024 } : {};
-    onProgress(10);
-    let sample = await fetchByteRangeSample(streamUrl, (p) => onProgress(10 + p * 0.4), sampleOpts, baseHeaders);
-    if (sample?.durationSec) {
-      detectedDuration = detectedDuration || sample.durationSec;
+    let sample = null;
+    let fullFetchedUpfront = false;
+
+    if (wantsFullStream && !isHls) {
+      const statusMsg = 'Complete mode: downloading full stream...';
+      try {
+        onProgress(10, statusMsg);
+        const full = await fetchFullStreamBuffer(streamUrl, (p) => onProgress(10 + p * 0.4, statusMsg), baseHeaders);
+        const fullBuf = full?.buffer || full;
+        sample = {
+          ...full,
+          buffer: fullBuf,
+          partial: false,
+          durationSec: probeContainerDuration(fullBuf) || detectedDuration || null
+        };
+        if (sample?.durationSec && !detectedDuration) {
+          detectedDuration = sample.durationSec;
+        }
+        fullFetchedUpfront = true;
+        if (ctx?.tabId) {
+          const sizeMb = fullBuf?.byteLength ? Math.round(fullBuf.byteLength / (1024 * 1024)) : 'unknown';
+          sendDebugLog(ctx.tabId, ctx.messageId, `Complete mode: fetched full stream first (~${sizeMb} MB)`, 'info');
+        }
+      } catch (fullErr) {
+        console.warn('[Background] Upfront full fetch failed, falling back to ranged sample:', fullErr?.message || fullErr);
+        if (ctx?.tabId) {
+          sendDebugLog(ctx.tabId, ctx.messageId, `Full fetch upfront failed (${fullErr?.message || fullErr}); falling back to range sample`, 'warn');
+        }
+      }
+    }
+
+    if (!sample) {
+      onProgress(10);
+      sample = await fetchByteRangeSample(streamUrl, (p) => onProgress(10 + p * 0.4), sampleOpts, baseHeaders);
+      if (sample?.durationSec) {
+        detectedDuration = detectedDuration || sample.durationSec;
+      }
+      if (ctx?.tabId) {
+        sendDebugLog(ctx.tabId, ctx.messageId, `Byte-range sample: duration=${sample?.durationSec || 'n/a'}s partial=${sample?.partial === true} totalBytes=${sample?.totalBytes || 'n/a'}`, 'info');
+      }
     }
     if (detectedDuration) {
       onProgress(14, `Detected runtime ~${formatSecondsShort(detectedDuration)}`);
+    }
+
+    const sampleBytes = sample?.buffer?.byteLength || sample?.byteLength || 0;
+    const declaredTotal = sample?.totalBytes || null;
+    const looksPartial = sample?.partial === true || (wantsFullStream && declaredTotal && sampleBytes && sampleBytes < declaredTotal * 0.98);
+    if (wantsFullStream && looksPartial && !fullFetchedUpfront) {
+      const sizeGuardBytes = declaredTotal || sampleBytes || 0;
+      const allowFullFetch = !sizeGuardBytes || sizeGuardBytes <= 4 * 1024 * 1024 * 1024; // allow multi-GB streams; only skip if clearly extreme
+      if (ctx?.tabId) {
+        const humanSize = sizeGuardBytes ? `${Math.round(sizeGuardBytes / (1024 * 1024))}MB` : 'unknown size';
+        sendDebugLog(ctx.tabId, ctx.messageId, `Sample looks partial (${humanSize}); fetching full stream for complete coverage...`, allowFullFetch ? 'warn' : 'error');
+      }
+      if (allowFullFetch) {
+        const statusMsg = 'Sample looks partial; downloading full stream for complete coverage...';
+        try {
+          const full = await fetchFullStreamBuffer(streamUrl, (p) => onProgress(48 + p * 0.18, statusMsg), baseHeaders);
+          const fullBuf = full?.buffer || full;
+          sample = {
+            ...sample,
+            ...full,
+            buffer: fullBuf,
+            partial: false,
+            totalBytes: full?.totalBytes || declaredTotal || null,
+            durationSec: probeContainerDuration(fullBuf) || sample?.durationSec || detectedDuration || null
+          };
+          if (sample?.durationSec && !detectedDuration) {
+            detectedDuration = sample.durationSec;
+          }
+          if (ctx?.tabId) {
+            const sizeMb = fullBuf?.byteLength ? Math.round(fullBuf.byteLength / (1024 * 1024)) : 'unknown';
+            sendDebugLog(ctx.tabId, ctx.messageId, `Full stream fetched (~${sizeMb} MB); continuing with complete buffer`, 'info');
+          }
+        } catch (fullErr) {
+          console.warn('[Background] Full fetch fallback failed:', fullErr?.message || fullErr);
+          if (ctx?.tabId) {
+            sendDebugLog(ctx.tabId, ctx.messageId, `Full fetch fallback failed: ${fullErr?.message || fullErr}`, 'error');
+          }
+        }
+      }
     }
 
     const estimateCoverageSec = (sampleObj, totalSec) => {
@@ -1347,6 +1759,9 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
       onProgress(18, `Sync plan: ${describePlanForLog(effectivePlan)}`);
       if (ctx?.tabId) {
         sendDebugLog(ctx.tabId, ctx.messageId, `Window specs (${windowSpecs.length}): ${JSON.stringify(windowSpecs)}`, 'info');
+        if (sampleCoverageSec) {
+          sendDebugLog(ctx.tabId, ctx.messageId, `Coverage estimate from sample ~${Math.round(sampleCoverageSec)}s of audio`, 'info');
+        }
       }
     }
 
@@ -1435,7 +1850,8 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
         {
           strictWhenTooFew: true,
           allowPartialOnStrictFail: false,
-          requireAll: true
+          requireAll: true,
+          audioStreamIndex: opts?.audioStreamIndex
         }
       );
     };
@@ -1443,20 +1859,269 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
     if (sample?.partial) {
       onProgress(55, 'Partial fetch detected; drift correction may be limited');
       console.warn('[Background] Partial fetch; drift correction may be limited');
+      if (ctx?.tabId) {
+        sendDebugLog(ctx.tabId, ctx.messageId, 'Partial fetch detected; attempting tail fetch for late windows', 'warn');
+      }
     }
 
-    audioWindows = await tryDecode(sample, 70, 0.2);
+    let decodeError = null;
+    try {
+      audioWindows = await tryDecode(sample, 70, 0.2);
+    } catch (err) {
+      decodeError = err;
+    }
+
+    const fullFetchRetry = async (reasonLabel) => {
+      const statusMsg = reasonLabel || 'Retrying audio decode with full stream...';
+      try {
+        const full = await fetchFullStreamBuffer(streamUrl, (p) => onProgress(70 + p * 0.15, statusMsg), baseHeaders);
+        const fullBuf = full?.buffer || full;
+        sample = {
+          ...sample,
+          ...full,
+          buffer: fullBuf,
+          partial: false,
+          totalBytes: full?.totalBytes || sample?.totalBytes || null,
+          durationSec: probeContainerDuration(fullBuf) || sample?.durationSec || detectedDuration || null
+        };
+        if (sample?.durationSec && !detectedDuration) {
+          detectedDuration = sample.durationSec;
+        }
+        const durationForRetry = detectedDuration || sample?.durationSec || planInput?.durationSeconds || null;
+        ({ windows: windowSpecs, plan: effectivePlan } = computePlanAndWindows(durationForRetry || durationForPlan));
+        if (effectivePlan && ctx?.tabId) {
+          sendDebugLog(ctx.tabId, ctx.messageId, `Retry decode after full fetch; window specs (${windowSpecs.length}): ${JSON.stringify(windowSpecs)}`, 'info');
+        }
+        audioWindows = await tryDecode(sample, 85, 0.12, statusMsg);
+        decodeError = null;
+      } catch (fullErr) {
+        decodeError = fullErr;
+        if (ctx?.tabId) {
+          sendDebugLog(ctx.tabId, ctx.messageId, `Full-fetch retry failed: ${fullErr?.message || fullErr}`, 'error');
+        }
+      }
+    };
+
+    const sampleFullyFetched = sample?.partial === false && (!sample?.totalBytes || !sample?.buffer?.byteLength || sample.buffer.byteLength >= sample.totalBytes * 0.98);
+    if (decodeError && !sampleFullyFetched) {
+      if (ctx?.tabId) {
+        sendDebugLog(ctx.tabId, ctx.messageId, `Decode failed (${decodeError?.message || decodeError}); retrying after full fetch...`, 'warn');
+      }
+      await fullFetchRetry('Decode failed; downloading full stream to retry...');
+    }
+
+    if (decodeError) {
+      throw decodeError;
+    }
 
     if (!audioWindows || !audioWindows.length) {
       throw new Error('Audio decode returned no windows');
     }
 
     onProgress(95);
+    if (ctx?.tabId) {
+      const totalBytes = audioWindows.reduce((sum, w) => sum + (w?.audioBlob?.size || 0), 0);
+      sendDebugLog(ctx.tabId, ctx.messageId, `Audio extraction complete (${audioWindows.length} window(s), totalBytes=${totalBytes})`, 'info');
+    }
     return audioWindows;
 
   } catch (error) {
     console.error('[Background] Audio extraction failed:', error);
     throw new Error(`Audio extraction failed: ${error.message}`);
+  }
+}
+
+async function handleAutoSubRequest(message, tabId) {
+  const { messageId, data = {} } = message || {};
+  const streamUrl = data.streamUrl;
+  const cfAccountId = data.cfAccountId || data.accountId;
+  const cfToken = data.cfToken || data.token;
+  const model = data.model || '@cf/openai/whisper';
+  let sourceLanguage = (data.sourceLanguage || data.language || '').trim();
+  const diarization = data.diarization === true;
+  const pageHeaders = data.pageHeaders || null;
+  const ctx = { tabId, messageId, pageHeaders };
+
+  if (!streamUrl) {
+    return { success: false, error: 'Missing stream URL' };
+  }
+  if (!cfAccountId || !cfToken) {
+    return { success: false, error: 'Cloudflare credentials are required' };
+  }
+
+  try {
+    const host = (() => { try { return new URL(streamUrl || '').hostname; } catch (_) { return streamUrl || ''; } })();
+    sendDebugLog(tabId, messageId, `Auto-sub request received (model=${model}, diarization=${diarization}) host=${host || 'n/a'}`, 'info');
+    const cfWindowCapSec = 90; // ~2.9 MB at 16k/16-bit mono, keeps well below Cloudflare's effective payload guard
+    const planInput = {
+      preset: 'complete',
+      fullScan: true,
+      strategy: 'full',
+      coveragePct: 1,
+      minWindows: null,
+      maxWindows: null,
+      requestedWindowSeconds: cfWindowCapSec,
+      maxChunkSeconds: cfWindowCapSec
+    };
+
+    const buildBaseHeaders = (fromPageHeaders) => {
+      const h = fromPageHeaders || {};
+      const headers = {};
+      if (h.referer) headers.Referer = h.referer;
+      if (h.cookie) headers.Cookie = h.cookie;
+      if (h.userAgent) headers['User-Agent'] = h.userAgent;
+      return Object.keys(headers).length ? headers : null;
+    };
+
+    const baseHeaders = buildBaseHeaders(pageHeaders);
+
+    const pickPreferredTrack = (tracks, langHint) => {
+      if (!Array.isArray(tracks) || !tracks.length) return { preferred: null, ordered: [] };
+      const normalize = (l) => (l || '').split('-')[0].toLowerCase();
+      const hint = normalize(langHint || '');
+      const ordered = [...tracks];
+      const byHint = hint ? ordered.find(t => normalize(t.language) === hint) : null;
+      const byEn = ordered.find(t => normalize(t.language) === 'en');
+      const preferred = byHint || byEn || ordered[0];
+      return { preferred, ordered };
+    };
+
+    const probeAudioTracks = async () => {
+      try {
+        const sample = await fetchByteRangeSample(
+          streamUrl,
+          () => { },
+          { minBytes: 12 * 1024 * 1024, maxBytesCap: 64 * 1024 * 1024 },
+          baseHeaders
+        );
+        const headerInfo = parseMkvHeaderInfo(sample.buffer, { maxScanBytes: Math.min(sample.buffer.byteLength, 12 * 1024 * 1024) });
+        const audioTracks = (headerInfo?.tracks || [])
+          .filter(t => t.type === 0x02 || t.type === 2)
+          .map((t, idx) => ({
+            index: idx,
+            trackNumber: typeof t.number === 'number' ? t.number : idx + 1,
+            language: (t.language || '').trim(),
+            name: t.name || '',
+            codec: t.codecId || ''
+          }));
+        return audioTracks;
+      } catch (err) {
+        console.warn('[Background] Audio track probe failed:', err?.message || err);
+        if (tabId) {
+          sendDebugLog(tabId, messageId, `Audio track probe failed: ${err?.message || err}`, 'warn');
+        }
+        return [];
+      }
+    };
+
+    const isMixedLangError = (err) => {
+      const msg = (err?.message || '').toLowerCase();
+      return msg.includes('different language') || msg.includes('unsupported audio input') || msg.includes('language');
+    };
+
+    const audioTracks = await probeAudioTracks();
+    if (audioTracks.length) {
+      const trackSummaries = audioTracks.map(t => `#${t.trackNumber || t.index + 1}${t.language ? `(${t.language})` : ''}${t.name ? ` ${t.name}` : ''}`).join(' | ');
+      sendDebugLog(tabId, messageId, `Detected audio tracks: ${trackSummaries}`, 'info');
+    }
+    const { preferred, ordered } = pickPreferredTrack(audioTracks, sourceLanguage || 'en');
+    if (!sourceLanguage && preferred?.language) {
+      sourceLanguage = preferred.language;
+    }
+
+    const attemptAutoSub = async (audioStreamIndex) => {
+      sendAutoSubProgress(tabId, messageId, 5, `Preparing pipeline (audio track ${audioStreamIndex + 1})...`, 'init');
+      sendAutoSubProgress(tabId, messageId, 8, 'Fetching stream...', 'fetch');
+      const audioWindows = await extractAudioFromStream(
+        streamUrl,
+        planInput,
+        (p, status) => {
+          // Only log a label when provided; otherwise just advance progress to avoid spamming the same text.
+          sendAutoSubProgress(tabId, messageId, Math.min(60, Math.round(p)), status || null, 'fetch');
+        },
+        ctx,
+        { audioStreamIndex }
+      );
+      sendAutoSubProgress(tabId, messageId, 65, 'Audio ready. Sending to Cloudflare...', 'transcribe');
+      sendDebugLog(tabId, messageId, `Audio ready; forwarding ${audioWindows.length} window(s) to Cloudflare (audio track ${audioStreamIndex + 1}, lang=${sourceLanguage || 'auto'})`, 'info');
+      try {
+        const transcript = await transcribeWindowsWithCloudflare(
+          audioWindows,
+          { accountId: cfAccountId, token: cfToken, model, sourceLanguage, diarization, filename: data.filename || 'audio' },
+          (p, status) => sendAutoSubProgress(tabId, messageId, Math.min(92, Math.round(p)), status || 'Transcribing...', 'transcribe'),
+          ctx
+        );
+        sendAutoSubProgress(tabId, messageId, 96, 'Transcript ready. Finalizing...', 'package');
+        sendDebugLog(tabId, messageId, `Transcript ready (segments=${transcript.segmentCount || '?'}, lang=${transcript.languageCode || 'und'})`, 'info');
+        const payload = { success: true, ...transcript };
+        sendAutoSubResult(tabId, messageId, payload);
+        return payload;
+      } catch (cfErr) {
+        if (!isMixedLangError(cfErr)) throw cfErr;
+        sendDebugLog(tabId, messageId, `Cloudflare reported mixed language; falling back to local Whisper autodetect... (${cfErr?.message || cfErr})`, 'warn');
+        sendAutoSubProgress(tabId, messageId, 68, 'Cloudflare rejected audio; retrying locally...', 'transcribe');
+        const whisperSegs = await transcribeAudioWindows(
+          audioWindows,
+          'single',
+          (p, status) => sendAutoSubProgress(tabId, messageId, Math.min(92, Math.round(p)), status || 'Transcribing with Whisper...', 'transcribe'),
+          ctx
+        );
+        const normalizedSegs = whisperSegs.map((seg) => ({
+          start: (seg.startMs || 0) / 1000,
+          end: (seg.endMs || seg.startMs || 0) / 1000,
+          text: seg.text || seg.transcript || ''
+        }));
+        const srt = segmentsToSrt(normalizedSegs);
+        const totalBytes = audioWindows.reduce((sum, w) => sum + (w?.audioBlob?.size || 0), 0);
+        const payload = {
+          success: true,
+          srt,
+          languageCode: sourceLanguage || 'und',
+          segmentCount: normalizedSegs.length,
+          cfStatus: null,
+          cfBody: '',
+          model: `${model || '@cf/openai/whisper'}+local-fallback`,
+          audioBytes: totalBytes,
+          audioSource: 'extension',
+          contentType: 'audio/wav'
+        };
+        sendAutoSubProgress(tabId, messageId, 96, 'Transcript ready (local fallback). Finalizing...', 'package');
+        sendDebugLog(tabId, messageId, `Local Whisper fallback succeeded (${normalizedSegs.length} segments)`, 'info');
+        sendAutoSubResult(tabId, messageId, payload);
+        return payload;
+      }
+    };
+
+    const streamAttempts = (() => {
+      if (preferred) {
+        const others = ordered.filter(t => t.index !== preferred.index).map(t => t.index);
+        return [preferred.index, ...others];
+      }
+      return [0, 1];
+    })();
+    let lastErr = null;
+    for (let i = 0; i < streamAttempts.length; i++) {
+      try {
+        return await attemptAutoSub(streamAttempts[i]);
+      } catch (err) {
+        lastErr = err;
+        if (isMixedLangError(err) && i < streamAttempts.length - 1) {
+          sendDebugLog(tabId, messageId, `Cloudflare rejected audio track ${streamAttempts[i] + 1} as mixed-language; retrying with track ${streamAttempts[i + 1] + 1}...`, 'warn');
+          continue;
+        }
+        throw err;
+      }
+    }
+    if (lastErr) throw lastErr;
+  } catch (error) {
+    console.error('[Background] Auto-sub request failed:', error);
+    const msg = error?.message || 'Auto-subtitles failed';
+    sendDebugLog(tabId, messageId, `Auto-sub failed: ${msg}${error?.stack ? ` | stack: ${error.stack.slice(0, 400)}` : ''}`, 'error');
+    sendDebugLog(tabId, messageId, `Auto-sub failed: ${msg}`, 'error');
+    sendAutoSubProgress(tabId, messageId, 100, `Failed: ${msg}`, 'error', 'error');
+    const payload = { success: false, error: msg };
+    sendAutoSubResult(tabId, messageId, payload);
+    return payload;
   }
 }
 /**
@@ -2187,13 +2852,24 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
 /**
  * Decode audio windows via offscreen document (Worker-capable context).
  */
-async function decodeWindowsOffscreen(windows, mode, onProgress) {
+async function decodeWindowsOffscreen(windows, mode, onProgress, ctx = null, opts = {}) {
+  const logToPage = (text, level = 'info') => {
+    if (ctx?.tabId) sendDebugLog(ctx.tabId, ctx.messageId, text, level);
+  };
   const endOffscreen = startOffscreenSession();
   try {
     await ensureOffscreenDocument();
     const messageId = `adecode_${Date.now()}`;
 
     const prepared = [];
+    const sharedBuffers = new WeakMap();
+    const startTs = Date.now();
+    let idbBuffers = 0;
+    let chunkedBuffers = 0;
+    let directBuffers = 0;
+    let reusedBuffers = 0;
+    logToPage(`Offscreen decode starting (${windows.length} window(s)); chunkBytes=${OFFSCREEN_CHUNK_BYTES}`, 'info');
+
     for (let i = 0; i < windows.length; i++) {
       const win = windows[i];
       let buffer = normalizeBufferForTransfer(win.buffer);
@@ -2206,17 +2882,49 @@ async function decodeWindowsOffscreen(windows, mode, onProgress) {
       const u8 = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
       if (!u8?.byteLength) continue;
 
-      let transferId = null;
-      let directBuffer = u8;
-      if (u8.byteLength > MAX_DIRECT_OFFSCREEN_BYTES) {
-        const chunkRes = await sendBufferToOffscreenInChunks(u8, `${messageId}_${i}`, null);
-        transferId = chunkRes.transferId;
-        directBuffer = null;
+      const key = u8.buffer;
+      const cached = sharedBuffers.get(key);
+
+      let transferId = cached?.transferId || null;
+      let directBuffer = cached?.directBuffer || null;
+      let transferMethod = cached?.transferMethod || null;
+
+      if (!cached) {
+        if (u8.byteLength > MAX_DIRECT_OFFSCREEN_BYTES) {
+          const sizeMb = Math.round((u8.byteLength / (1024 * 1024)) * 10) / 10;
+          try {
+            const Transfer = await ensureTransferHelper();
+            const id = `idb_${messageId || Date.now()}_${i}_${Math.random().toString(16).slice(2)}`;
+            await Transfer.saveTransferBuffer(id, u8);
+            transferId = id;
+            transferMethod = 'idb';
+            directBuffer = null;
+            idbBuffers += 1;
+            logToPage(`Stashed window buffer #${i + 1} (~${sizeMb} MB) in IDB -> ${id}`, 'info');
+          } catch (stashErr) {
+            const chunkRes = await sendBufferToOffscreenInChunks(u8, `${messageId}_${i}`, ctx?.tabId);
+            transferId = chunkRes.transferId;
+            transferMethod = 'chunks';
+            directBuffer = null;
+            logToPage(`Chunked window buffer #${i + 1} (~${sizeMb} MB) -> transferId ${transferId}`, 'warn');
+            chunkedBuffers += 1;
+          }
+        } else {
+          directBuffer = u8;
+          transferMethod = null;
+          logToPage(`Reusing direct buffer for window #${i + 1} (${u8.byteLength} bytes)`, 'debug');
+          directBuffers += 1;
+        }
+        sharedBuffers.set(key, { transferId, directBuffer, transferMethod });
+      } else {
+        logToPage(`Reusing shared buffer for window #${i + 1} (${transferId ? transferMethod || 'chunked' : 'direct'})`, 'debug');
+        reusedBuffers += 1;
       }
 
       prepared.push({
         buffer: directBuffer || undefined,
         transferId: transferId || undefined,
+        transferMethod: transferMethod || undefined,
         startSec: win.startSec,
         durSec: win.durSec,
         seekToSec: win.seekToSec
@@ -2226,13 +2934,18 @@ async function decodeWindowsOffscreen(windows, mode, onProgress) {
     if (!prepared.length) {
       throw new Error('No audio windows to send to offscreen decoder');
     }
+    logToPage(
+      `Prepared ${prepared.length}/${windows.length} window(s) for offscreen decode (idb=${idbBuffers}, chunked=${chunkedBuffers}, direct=${directBuffers}, reused=${reusedBuffers})`,
+      'info'
+    );
 
     const { promise, cancel } = waitForOffscreenResult(messageId, 240000);
     const payload = {
       type: 'OFFSCREEN_FFMPEG_DECODE',
       messageId,
       windows: prepared,
-      mode: mode || 'single'
+      mode: mode || 'single',
+      audioStreamIndex: Number.isInteger(opts.audioStreamIndex) ? opts.audioStreamIndex : 0
     };
 
     await new Promise((resolve, reject) => {
@@ -2259,6 +2972,8 @@ async function decodeWindowsOffscreen(windows, mode, onProgress) {
     if (!audioWindows.length) {
       throw new Error('Offscreen audio decode returned no windows');
     }
+
+    logToPage(`Offscreen decode finished (${audioWindows.length} window(s)) in ${Date.now() - startTs}ms`, 'info');
 
     const mapped = audioWindows.map((w, idx) => {
       const bytes = new Uint8Array(w.audioBytes || []);
@@ -2975,6 +3690,31 @@ function sendExtractResult(tabId, messageId, payload) {
   });
 }
 
+function sendAutoSubProgress(tabId, messageId, progress, status, stage = 'info', level = 'info') {
+  if (!tabId) return;
+  chrome.tabs.sendMessage(tabId, {
+    type: 'AUTOSUB_PROGRESS',
+    messageId,
+    progress: Math.round(progress),
+    status,
+    stage,
+    level
+  }).catch(err => {
+    console.error('[Background] Failed to send auto-sub progress:', err);
+  });
+}
+
+function sendAutoSubResult(tabId, messageId, payload) {
+  if (!tabId) return;
+  chrome.tabs.sendMessage(tabId, {
+    type: 'AUTOSUB_RESPONSE',
+    messageId,
+    ...payload
+  }).catch(err => {
+    console.error('[Background] Failed to send auto-sub result:', err);
+  });
+}
+
 function sendDebugLog(tabId, messageId, text, level = 'info') {
   // Always emit logs tied to a specific job so tool pages can surface background activity,
   // even when verbose mode is toggled off.
@@ -3141,6 +3881,7 @@ const SYNC_PLAN_DEFAULTS = {
 };
 const PLAN_MIN_WINDOW_SECONDS = 20;
 const PLAN_MAX_WINDOW_SECONDS = 7200;
+const PLAN_FULLSCAN_DEFAULT_CHUNK_CAP = 180;
 
 function normalizeSyncPlan(plan, mode) {
   const presetKey = (plan?.preset || mode || 'smart').toString().toLowerCase();
@@ -3178,6 +3919,13 @@ function normalizeSyncPlan(plan, mode) {
     || (typeof mode === 'string' && ['alass', 'ffsubsync', 'vosk-ctc', 'whisper-alass'].includes(mode) ? mode : null)
     || inferModeGroup();
   const useFingerprintPrepass = plan?.useFingerprintPrepass !== false;
+  const maxChunkSeconds = (() => {
+    const raw = Number.isFinite(plan?.maxChunkSeconds)
+      ? plan.maxChunkSeconds
+      : (Number.isFinite(plan?.maxWindowSeconds) ? plan.maxWindowSeconds : null);
+    if (!Number.isFinite(raw)) return null;
+    return Math.max(PLAN_MIN_WINDOW_SECONDS, Math.min(raw, PLAN_MAX_WINDOW_SECONDS));
+  })();
 
   return {
     preset: plan?.preset || presetKey,
@@ -3194,12 +3942,16 @@ function normalizeSyncPlan(plan, mode) {
     strategy,
     fullScan,
     modeGroup,
-    useFingerprintPrepass
+    useFingerprintPrepass,
+    maxChunkSeconds
   };
 }
 
 function adaptPlanToDuration(plan, durationSeconds) {
   const duration = Number.isFinite(durationSeconds) ? Math.max(0, durationSeconds) : plan.durationSeconds;
+  const maxChunkSeconds = Number.isFinite(plan?.maxChunkSeconds)
+    ? Math.max(PLAN_MIN_WINDOW_SECONDS, Math.min(plan.maxChunkSeconds, PLAN_MAX_WINDOW_SECONDS))
+    : null;
   let windowSeconds = plan.windowSeconds;
   if (Number.isFinite(plan.requestedWindowSeconds)) {
     windowSeconds = plan.requestedWindowSeconds;
@@ -3213,6 +3965,9 @@ function adaptPlanToDuration(plan, durationSeconds) {
   }
   if (duration && Number.isFinite(windowSeconds) && windowSeconds > duration) {
     windowSeconds = duration;
+  }
+  if (Number.isFinite(windowSeconds) && Number.isFinite(maxChunkSeconds) && windowSeconds > maxChunkSeconds) {
+    windowSeconds = maxChunkSeconds;
   }
 
   const windowCountLocked = Number.isFinite(plan.windowCount);
@@ -3233,10 +3988,13 @@ function adaptPlanToDuration(plan, durationSeconds) {
   return {
     ...plan,
     durationSeconds: duration || null,
-    windowSeconds: Number.isFinite(windowSeconds) ? Math.min(Math.max(windowSeconds, PLAN_MIN_WINDOW_SECONDS), PLAN_MAX_WINDOW_SECONDS) : null,
+    windowSeconds: Number.isFinite(windowSeconds)
+      ? Math.min(Math.max(windowSeconds, PLAN_MIN_WINDOW_SECONDS), Number.isFinite(maxChunkSeconds) ? maxChunkSeconds : PLAN_MAX_WINDOW_SECONDS)
+      : null,
     windowCount: plan.fullScan ? null : windowCount,
     coverageSeconds,
-    durationAdjusted: plan.durationAdjusted || (!!duration && plan.durationSeconds !== duration)
+    durationAdjusted: plan.durationAdjusted || (!!duration && plan.durationSeconds !== duration),
+    maxChunkSeconds
   };
 }
 
@@ -3248,9 +4006,11 @@ function planWindows(totalDurationSec, plan) {
       ? Math.max(effective.windowSeconds * effective.windowCount * 1.1, effective.windowSeconds * 3)
       : 0);
   const dur = Math.max(60, inferred || 0);
+  const maxChunkSeconds = Number.isFinite(effective.maxChunkSeconds) ? effective.maxChunkSeconds : null;
 
   if (effective.fullScan) {
-    const chunk = Math.min(180, Math.max(60, dur / Math.max(1, Math.ceil(dur / 600))));
+    const chunkCap = maxChunkSeconds || PLAN_FULLSCAN_DEFAULT_CHUNK_CAP;
+    const chunk = Math.min(chunkCap, Math.max(60, dur / Math.max(1, Math.ceil(dur / 600))));
     const count = Math.max(1, Math.ceil(dur / chunk));
     const denom = Math.max(1, count - 1);
     const windows = Array.from({ length: count }).map((_, i) => {
@@ -3258,11 +4018,14 @@ function planWindows(totalDurationSec, plan) {
       const start = Math.max(0, Math.min(Math.max(0, dur - chunk), (dur * pos) - (chunk / 2)));
       return { startSec: start, durSec: chunk };
     });
-    return { windows, plan: effective };
+    return { windows, plan: { ...effective, windowCount: count, windowSeconds: chunk, coverageSeconds: count * chunk } };
   }
 
   let windowCount = Math.max(1, effective.windowCount || effective.minWindows || 3);
   let winDur = Math.max(PLAN_MIN_WINDOW_SECONDS, Math.min(PLAN_MAX_WINDOW_SECONDS, effective.windowSeconds || 60));
+  if (Number.isFinite(maxChunkSeconds)) {
+    winDur = Math.min(winDur, maxChunkSeconds);
+  }
   const strategy = effective.strategy || 'spread';
   const denom = Math.max(1, windowCount - 1);
   const mapPosition = (idx) => {
@@ -3288,11 +4051,13 @@ function describePlanForLog(plan) {
   const parts = [`preset=${plan.preset || 'smart'}`];
   if (Number.isFinite(plan.windowCount)) parts.push(`windows=${plan.windowCount}`);
   if (Number.isFinite(plan.windowSeconds)) parts.push(`windowSeconds=${Math.round(plan.windowSeconds)}`);
+  if (Number.isFinite(plan.maxChunkSeconds)) parts.push(`maxChunkSec=${Math.round(plan.maxChunkSeconds)}`);
   if (Number.isFinite(plan.coverageTargetPct)) parts.push(`target=${Math.round((plan.coverageTargetPct || 0) * 100)}%`);
   if (Number.isFinite(plan.coverageSeconds)) parts.push(`coverageSec=${Math.round(plan.coverageSeconds)}`);
   if (Number.isFinite(plan.durationSeconds)) parts.push(`duration=${formatSecondsShort(plan.durationSeconds)}`);
   if (plan.useFingerprintPrepass === false) parts.push('fingerprint=off');
   else if (plan.useFingerprintPrepass === true) parts.push('fingerprint=on');
+  if (plan.language) parts.push(`lang=${plan.language}`);
   return `Plan: ${parts.join(', ')}`;
 }
 
@@ -4468,6 +5233,9 @@ function hydrateOffscreenResult(msg) {
       if (w?.transferId) {
         const buf = consumeResultBuffer(w.transferId);
         if (!buf) {
+          const entry = _offscreenResultChunks.get(w.transferId);
+          const diag = entry ? { received: entry.received, total: entry.totalChunks, missing: (entry.parts || []).filter(p => !p).length } : null;
+          console.warn('[Background][Offscreen] Missing audio buffer for window', idx + 1, { transferId: w.transferId, diag });
           throw new Error(`Missing audio buffer for window ${idx + 1}`);
         }
         return {
@@ -4716,7 +5484,7 @@ function normalizeBufferForTransfer(buffer) {
 }
 
 const MAX_DIRECT_OFFSCREEN_BYTES = 4 * 1024 * 1024; // keep direct messages comfortably under runtime cap
-const OFFSCREEN_CHUNK_BYTES = 128 * 1024; // chunk size for large buffers to offscreen page
+const OFFSCREEN_CHUNK_BYTES = 512 * 1024; // larger chunks to cut transfer time without hitting message caps
 
 function isMessageLengthError(err) {
   const msg = err?.message || '';
@@ -5860,15 +6628,18 @@ async function decodeWindowsWithFFmpeg(windows, mode, onProgress, ctx = null, op
   }
   try {
     onProgress?.(70, 'Decoding audio via offscreen FFmpeg...');
-    decoded = await decodeWindowsOffscreen(windows, mode, onProgress);
+    sendDebugLog(ctx?.tabId, ctx?.messageId, `Dispatching offscreen decode (${expectedCount} window(s))`, 'info');
+    decoded = await decodeWindowsOffscreen(windows, mode, onProgress, ctx, { audioStreamIndex: opts?.audioStreamIndex });
   } catch (offErr) {
     console.warn('[Background] Offscreen FFmpeg decode failed:', offErr?.message || offErr);
     // Secondary best-effort local decode (may fail in service worker)
     try {
       onProgress?.(75, 'Retrying audio decode locally...');
-      decoded = await decodeWindowsLocal(windows, mode, onProgress);
+      sendDebugLog(ctx?.tabId, ctx?.messageId, `Offscreen decode failed (${offErr?.message || offErr}); retrying locally`, 'warn');
+      decoded = await decodeWindowsLocal(windows, mode, onProgress, { audioStreamIndex: opts?.audioStreamIndex });
     } catch (localErr) {
       console.warn('[Background] Local FFmpeg decode also failed:', localErr?.message || localErr);
+      sendDebugLog(ctx?.tabId, ctx?.messageId, `Local FFmpeg decode failed: ${localErr?.message || localErr}`, 'error');
       throw offErr || localErr;
     }
   }
@@ -5900,7 +6671,7 @@ async function decodeWindowsWithFFmpeg(windows, mode, onProgress, ctx = null, op
   return validWindows;
 }
 
-async function decodeWindowsLocal(windows, mode, onProgress) {
+async function decodeWindowsLocal(windows, mode, onProgress, opts = {}) {
   const ffmpeg = await getFFmpeg(onProgress);
   if (!ffmpeg) throw new Error('FFmpeg not available');
 
@@ -5919,16 +6690,26 @@ async function decodeWindowsLocal(windows, mode, onProgress) {
       if (!sharedInputName) {
         ffmpeg.FS('writeFile', inputName, new Uint8Array(windows[i].buffer));
       }
-      const args = ['-i', inputName, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1'];
-      if (typeof windows[i].seekToSec === 'number' && windows[i].seekToSec > 0) {
-        args.unshift('-ss', String(windows[i].seekToSec));
-      }
-      if (typeof windows[i].durSec === 'number' && windows[i].durSec > 0) {
-        args.push('-t', String(windows[i].durSec));
-      }
-      args.push(outputName);
+      const buildArgs = () => {
+        const base = ['-i', inputName, '-vn'];
+        if (Number.isInteger(opts?.audioStreamIndex) && opts.audioStreamIndex >= 0) {
+          base.push('-map', `0:a:${opts.audioStreamIndex}`);
+        }
+        base.push('-acodec', 'pcm_s16le', '-ar', '16000');
+        // Avoid mixing bilingual dual-mono tracks; explicitly keep the left channel only.
+        base.push('-af', 'pan=mono|c0=c0', '-ac', '1');
+        const args = [...base];
+        if (typeof windows[i].durSec === 'number' && windows[i].durSec > 0) {
+          args.push('-t', String(windows[i].durSec));
+        }
+        args.push(outputName);
+        if (typeof windows[i].seekToSec === 'number' && windows[i].seekToSec > 0) {
+          args.unshift('-ss', String(windows[i].seekToSec));
+        }
+        return args;
+      };
 
-      await ffmpeg.run(...args);
+      await ffmpeg.run(...buildArgs());
       const data = ffmpeg.FS('readFile', outputName);
       if (!data?.byteLength) {
         throw new Error(`Empty decode result for window ${i + 1}`);

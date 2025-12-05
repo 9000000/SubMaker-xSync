@@ -1620,11 +1620,12 @@ async function getFFmpeg(messageId) {
   }
 }
 
-async function decodeAudioWindows(windows, mode, messageId) {
+async function decodeAudioWindows(windows, mode, messageId, opts = {}) {
   const ffmpeg = await getFFmpeg(messageId);
   const results = [];
   const sharedBuffer = windows.length > 1 && windows.every(w => w.buffer === windows[0].buffer);
   let sharedInputName = null;
+  const audioStreamIndex = Number.isInteger(opts.audioStreamIndex) ? opts.audioStreamIndex : 0;
 
   if (sharedBuffer) {
     sharedInputName = 'shared_input.bin';
@@ -1637,17 +1638,27 @@ async function decodeAudioWindows(windows, mode, messageId) {
     const outputName = `win_${i}.wav`;
     const buffer = win.buffer instanceof Uint8Array ? win.buffer : new Uint8Array(win.buffer);
     ffmpeg.FS('writeFile', inputName, buffer);
-    const args = ['-i', inputName, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1'];
-    if (typeof win.seekToSec === 'number' && win.seekToSec > 0) {
-      args.unshift('-ss', String(win.seekToSec));
-    }
-    if (typeof win.durSec === 'number' && win.durSec > 0) {
-      args.push('-t', String(win.durSec));
-    }
-    args.push(outputName);
+    const buildArgs = () => {
+      const base = ['-i', inputName, '-vn'];
+      if (Number.isInteger(audioStreamIndex) && audioStreamIndex >= 0) {
+        base.push('-map', `0:a:${audioStreamIndex}`);
+      }
+      base.push('-acodec', 'pcm_s16le', '-ar', '16000');
+      // Avoid mixing bilingual dual-mono tracks; explicitly keep the left channel only.
+      base.push('-af', 'pan=mono|c0=c0', '-ac', '1');
+      const args = [...base];
+      if (typeof win.durSec === 'number' && win.durSec > 0) {
+        args.push('-t', String(win.durSec));
+      }
+      args.push(outputName);
+      if (typeof win.seekToSec === 'number' && win.seekToSec > 0) {
+        args.unshift('-ss', String(win.seekToSec));
+      }
+      return args;
+    };
 
     try {
-      await ffmpeg.run(...args);
+      await ffmpeg.run(...buildArgs());
       const data = ffmpeg.FS('readFile', outputName);
       if (!data?.byteLength) {
         throw new Error(`FFmpeg produced empty audio for window ${i + 1}`);
@@ -2473,7 +2484,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const requestId = message?.messageId;
     console.log('[Offscreen] Handling OFFSCREEN_FFMPEG_DECODE', {
       requestId,
-      windowCount: Array.isArray(message?.windows) ? message.windows.length : 0
+      windowCount: Array.isArray(message?.windows) ? message.windows.length : 0,
+      audioStreamIndex: message?.audioStreamIndex
     });
     (async () => {
       let responded = false;
@@ -2526,10 +2538,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (!rawWindows.length) {
           throw new Error('No audio windows provided for decode');
         }
-        const windows = rawWindows.map((w, idx) => {
+
+        const windows = [];
+        for (let idx = 0; idx < rawWindows.length; idx++) {
+          const w = rawWindows[idx];
           let buf = w?.buffer;
+          const transferMethod = w?.transferMethod || (buf && buf.transferMethod);
           const transferId = w?.transferId || (buf && buf.transferId);
-          if (!buf && transferId) {
+
+          if (transferMethod === 'idb' && transferId) {
+            try {
+              buf = await SubMakerTransfer.loadTransferBuffer(transferId);
+              SubMakerTransfer.deleteTransferBuffer(transferId).catch(e => console.warn('Failed to delete transfer buffer', e));
+            } catch (err) {
+              throw new Error(`Failed to load IDB transfer buffer for window ${idx + 1}: ${err?.message || err}`);
+            }
+          } else if (!buf && transferId) {
             buf = consumeChunkedBuffer(transferId);
           }
           if (buf && buf.transferId) {
@@ -2538,16 +2562,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           if (!buf) {
             throw new Error(`Missing buffer for window ${idx + 1}`);
           }
-          return {
+          windows.push({
             buffer: buf instanceof Uint8Array ? buf : new Uint8Array(buf),
             startSec: w?.startSec,
             durSec: w?.durSec,
             seekToSec: w?.seekToSec
-          };
-        });
+          });
+        }
 
         const decoded = await withTimeout(
-          decodeAudioWindows(windows, 'single', requestId),
+          decodeAudioWindows(windows, 'single', requestId, { audioStreamIndex: message?.audioStreamIndex }),
           180000,
           `FFmpeg audio decode timed out${requestId ? ` (job ${requestId})` : ''}`
         );

@@ -248,6 +248,24 @@ chrome.runtime.onMessage.addListener((msg) => {
       tracks: msg.tracks || [],
       error: msg.error || null
     });
+  } else if (msg?.type === 'AUTOSUB_PROGRESS') {
+    sendToPage({
+      type: 'SUBMAKER_AUTOSUB_PROGRESS',
+      source: 'extension',
+      messageId: msg.messageId,
+      progress: msg.progress,
+      status: msg.status,
+      stage: msg.stage,
+      level: msg.level
+    });
+  } else if (msg?.type === 'AUTOSUB_RESPONSE') {
+    sendToPage({
+      type: 'SUBMAKER_AUTOSUB_RESPONSE',
+      source: 'extension',
+      messageId: msg.messageId,
+      success: msg.success,
+      transcript: msg
+    });
   }
 });
 
@@ -412,6 +430,10 @@ async function handlePageMessage(event) {
         await handleExtractRequest(message);
         break;
 
+      case 'SUBMAKER_AUTOSUB_REQUEST':
+        await handleAutoSubRequest(message);
+        break;
+
       case 'SUBMAKER_EMBEDDED_RESET':
         await handleEmbeddedReset(message);
         break;
@@ -435,6 +457,15 @@ async function handlePageMessage(event) {
     if (message.type === 'SUBMAKER_EXTRACT_REQUEST') {
       sendToPage({
         type: 'SUBMAKER_EXTRACT_RESPONSE',
+        messageId: message.messageId,
+        source: 'extension',
+        success: false,
+        error: error.message || 'Unknown error occurred'
+      });
+    }
+    if (message.type === 'SUBMAKER_AUTOSUB_REQUEST') {
+      sendToPage({
+        type: 'SUBMAKER_AUTOSUB_RESPONSE',
         messageId: message.messageId,
         source: 'extension',
         success: false,
@@ -599,6 +630,56 @@ async function handleExtractRequest(message) {
       source: 'extension',
       success: false,
       error: errorMsg
+    });
+  }
+}
+
+/**
+ * Handle auto-subtitles request from webpage (Cloudflare via extension)
+ */
+async function handleAutoSubRequest(message) {
+  console.log('[SubMaker xSync] Auto-sub request received:', {
+    messageId: message.messageId,
+    hasStreamUrl: !!message.data?.streamUrl
+  });
+
+  const { streamUrl, filename, model, sourceLanguage, diarization } = message.data || {};
+  const pageHeaders = {
+    referer: window.location.href || null,
+    cookie: document?.cookie || null,
+    userAgent: navigator?.userAgent || null
+  };
+
+  if (!streamUrl) {
+    throw new Error('Missing streamUrl in auto-sub request');
+  }
+  if (!/^https?:\/\//i.test(streamUrl)) {
+    throw new Error('Only http(s) stream URLs are supported');
+  }
+
+  try {
+    const response = await sendRuntimeMessage({
+      type: 'AUTOSUB_REQUEST',
+      messageId: message.messageId,
+      data: {
+        streamUrl,
+        filename,
+        model,
+        sourceLanguage,
+        diarization,
+        cfAccountId: message.data?.cfAccountId || message.data?.accountId,
+        cfToken: message.data?.cfToken || message.data?.token,
+        pageHeaders
+      }
+    }, 'auto-subtitles');
+  } catch (error) {
+    console.error('[SubMaker xSync] Auto-sub request failed:', error);
+    sendToPage({
+      type: 'SUBMAKER_AUTOSUB_RESPONSE',
+      messageId: message.messageId,
+      source: 'extension',
+      success: false,
+      error: error.message || 'Auto-subtitles failed'
     });
   }
 }
