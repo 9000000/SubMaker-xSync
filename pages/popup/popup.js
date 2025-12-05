@@ -8,6 +8,12 @@ const DEFAULT_LOCALE = { lang: (navigator.language || 'en').split('-')[0], messa
 let locale = DEFAULT_LOCALE;
 const _popupBootTs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
 const FALLBACK_VERSION = '1.0.1'; // keep in sync with manifest; avoids runtime getManifest
+const PUBLIC_BASE = 'https://submaker.elfhosted.com';
+const DEFAULT_PATHS = {
+    configure: '/configure',
+    sync: '/subtitle-sync',
+    toolbox: '/sub-toolbox'
+};
 
 const versionEl = document.getElementById('version');
 const activeEl = document.getElementById('activeSyncs');
@@ -185,13 +191,13 @@ function bindButtons() {
     });
 
     openSyncPageBtn?.addEventListener('click', async () => {
-        const urls = await getStoredUrls();
-        window.open(urls.sync || 'http://localhost:7001/subtitle-sync', '_blank');
+        const target = await resolveTargetUrl('sync');
+        if (target) window.open(target, '_blank');
     });
 
     openToolboxBtn?.addEventListener('click', async () => {
-        const urls = await getStoredUrls();
-        window.open(urls.toolbox || 'http://localhost:7001/sub-toolbox', '_blank');
+        const target = await resolveTargetUrl('toolbox');
+        if (target) window.open(target, '_blank');
     });
 }
 
@@ -202,9 +208,8 @@ function initToolsToggle() {
 }
 
 async function openSettings() {
-    const urls = await getStoredUrls();
-    const fallback = 'http://localhost:7001/configure';
-    const target = urls.configure || fallback;
+    const target = await resolveTargetUrl('configure');
+    if (!target) return;
 
     if (chrome.runtime.openOptionsPage) {
         chrome.runtime.openOptionsPage(() => {
@@ -219,9 +224,8 @@ async function openSettings() {
 
 async function openConfigure(event) {
     event?.preventDefault();
-    const urls = await getStoredUrls();
-    const target = urls.configure || 'http://localhost:7001/configure';
-    window.open(target, '_blank');
+    const target = await resolveTargetUrl('configure');
+    if (target) window.open(target, '_blank');
 }
 
 async function getStoredUrls() {
@@ -235,6 +239,72 @@ async function getStoredUrls() {
     } catch (e) {
         return {};
     }
+}
+
+function getDefaultUrl(kind) {
+    const path = DEFAULT_PATHS[kind] || '';
+    return `${PUBLIC_BASE}${path}`;
+}
+
+function safeOrigin(url) {
+    try {
+        return new URL(url).origin;
+    } catch (_) {
+        return null;
+    }
+}
+
+async function checkHealth(origin) {
+    if (!origin) return false;
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), 1500) : null;
+    try {
+        const res = await fetch(`${origin}/health`, { cache: 'no-store', signal: controller?.signal });
+        return res.ok;
+    } catch (_) {
+        return false;
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
+
+async function resolveTargetUrl(kind) {
+    const urls = await getStoredUrls();
+    const stored = urls[kind];
+    const fallback = getDefaultUrl(kind);
+    let target = stored || fallback;
+    const origin = safeOrigin(target);
+    const reachable = await checkHealth(origin);
+
+    // If nothing was captured yet, always prompt before using the hosted default.
+    if (!stored) {
+        const msg = reachable
+            ? 'Use the hosted SubMaker setup now? (Choose “No” if you want to start your own server first.)'
+            : 'SubMaker is not reachable. Start your SubMaker or open the hosted setup?';
+        const proceed = confirm(msg);
+        if (!proceed) return null;
+        try {
+            const update = {};
+            update[`${kind}Url`] = fallback;
+            await chrome.storage.local.set(update);
+        } catch (_) { /* ignore */ }
+        return fallback;
+    }
+
+    // If we have a stored URL but it is unreachable, offer to switch to hosted.
+    if (!reachable) {
+        const switchMsg = 'SubMaker is not reachable. Switch to the hosted setup?';
+        const useHosted = confirm(switchMsg);
+        if (!useHosted) return null;
+        target = fallback;
+        try {
+            const update = {};
+            update[`${kind}Url`] = fallback;
+            await chrome.storage.local.set(update);
+        } catch (_) { /* ignore */ }
+    }
+
+    return target;
 }
 
 async function resetExtension() {
